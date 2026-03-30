@@ -1,0 +1,51 @@
+syntax = "proto3";
+
+package compute.v1;
+
+option go_package = "coordinator/pkg/pb";
+
+import "worker.proto";
+
+message SubmitJobRequest {
+  string container_image = 1;
+  repeated string command = 2;
+  ResourceSpec required_resources = 3;
+  map<string, string> environment = 4;
+  int32 max_runtime_seconds = 5;
+}
+
+message SubmitJobResponse {
+  JobID job_id = 1;
+  Status status = 2;
+}
+
+message GetJobStatusRequest {
+  JobID job_id = 1;
+}
+
+message GetJobStatusResponse {
+  Status status = 1;
+  string assigned_worker_id = 2;
+  int64 updated_at_unix = 3;
+}
+
+message GetJobResultRequest {
+  JobID job_id = 1;
+}
+
+message GetJobResultResponse {
+  Status status = 1;
+  bool result_available = 2;
+  Result result = 3;
+}
+
+service ClientService {
+  // Submits a new compute job to the coordinator.
+  rpc SubmitJob(SubmitJobRequest) returns (SubmitJobResponse);
+
+  // Returns current state for a submitted job.
+  rpc GetJobStatus(GetJobStatusRequest) returns (GetJobStatusResponse);
+
+  // Returns final result when available.
+  rpc GetJobResult(GetJobResultRequest) returns (GetJobResultResponse);
+}
