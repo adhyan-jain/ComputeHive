@@ -1,0 +1,107 @@
+syntax = "proto3";
+
+package compute.v1;
+
+option go_package = "coordinator/pkg/pb";
+
+// Stable identifier for a registered worker node.
+message WorkerID {
+  string value = 1;
+}
+
+// Stable identifier for a submitted job.
+message JobID {
+  string value = 1;
+}
+
+// Resource requirements or availability snapshot.
+message ResourceSpec {
+  int32 cpu_cores = 1;
+  int32 gpu_count = 2;
+  int32 memory_mb = 3;
+}
+
+// Lifecycle state of a job.
+enum Status {
+  STATUS_UNSPECIFIED = 0;
+  STATUS_QUEUED = 1;
+  STATUS_ASSIGNED = 2;
+  STATUS_RUNNING = 3;
+  STATUS_SUCCEEDED = 4;
+  STATUS_FAILED = 5;
+  STATUS_CANCELED = 6;
+}
+
+// Minimal executable job definition for worker execution.
+message Job {
+  JobID job_id = 1;
+  string container_image = 2;
+  repeated string command = 3;
+  ResourceSpec required_resources = 4;
+  Status status = 5;
+  int64 created_at_unix = 6;
+}
+
+// Worker-reported job execution result.
+message Result {
+  JobID job_id = 1;
+  Status status = 2;
+  int32 exit_code = 3;
+  string stdout_excerpt = 4;
+  string stderr_excerpt = 5;
+  string output_uri = 6;
+  int64 finished_at_unix = 7;
+}
+
+message RegisterWorkerRequest {
+  ResourceSpec available_resources = 1;
+  string worker_version = 2;
+}
+
+message RegisterWorkerResponse {
+  WorkerID worker_id = 1;
+  int32 heartbeat_interval_seconds = 2;
+}
+
+message HeartbeatRequest {
+  WorkerID worker_id = 1;
+  ResourceSpec available_resources = 2;
+  repeated JobID running_jobs = 3;
+}
+
+message HeartbeatResponse {
+  bool accepted = 1;
+  int64 server_time_unix = 2;
+}
+
+message RequestJobRequest {
+  WorkerID worker_id = 1;
+}
+
+message RequestJobResponse {
+  bool has_job = 1;
+  Job job = 2;
+}
+
+message SubmitResultRequest {
+  WorkerID worker_id = 1;
+  Result result = 2;
+}
+
+message SubmitResultResponse {
+  bool accepted = 1;
+}
+
+service WorkerService {
+  // Registers a worker and returns a stable worker ID.
+  rpc RegisterWorker(RegisterWorkerRequest) returns (RegisterWorkerResponse);
+
+  // Receives periodic worker liveness and capacity snapshots.
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+
+  // Asks the coordinator for the next schedulable job.
+  rpc RequestJob(RequestJobRequest) returns (RequestJobResponse);
+
+  // Submits terminal execution result for a job.
+  rpc SubmitResult(SubmitResultRequest) returns (SubmitResultResponse);
+}
