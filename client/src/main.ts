@@ -1,9 +1,10 @@
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
+import { openPath } from "@tauri-apps/plugin-opener";
 
 type Mode = "user" | "contributor";
 type BuildStatus = "idle" | "ready" | "working" | "done" | "error";
-type ActionKind = "build" | "request";
+type ProcessLogTone = "info" | "working" | "success" | "error";
 
 interface DockerImageResult {
   projectName: string;
@@ -55,6 +56,25 @@ interface IncomingRunRequest {
   projectRoot: string;
 }
 
+interface ContributorWorkerProfile {
+  workerId: string;
+  name: string;
+  email: string;
+  location: string;
+  workerVersion: string;
+  availableCpuCores: number;
+  availableGpuCount: number;
+  availableMemoryMb: number;
+  availableStorageGb: number;
+}
+
+interface ProcessLogEntry {
+  id: number;
+  tone: ProcessLogTone;
+  message: string;
+  timestamp: string;
+}
+
 interface InterfaceCopy {
   eyebrow: string;
   heading: string;
@@ -63,20 +83,23 @@ interface InterfaceCopy {
 
 const interfaceCopy: Record<Mode, InterfaceCopy> = {
   user: {
-    eyebrow: "Project Image Flow",
-    heading:
-      "Build locally, then request a queued run with a hashed tar.gz artifact.",
+    eyebrow: "Project flow",
+    heading: "Compile Hive",
     copy:
-      "Choose a project directory and let ComputeHive generate Docker setup when it is missing. You can build the Docker image locally, then request a run so the app compresses the image to a tar.gz artifact, hashes it, uploads it to object storage, and writes the queue records into Redis.",
+      "Choose a project directory. ComputeHive prepares Docker when needed, builds the image, compresses the artifact, uploads it, and writes the queue record.",
   },
   contributor: {
-    eyebrow: "Contributor Resource Flow",
-    heading:
-      "Inspect the incoming run queue with image tags, artifact hashes, and contributor-facing metadata.",
+    eyebrow: "Contributor flow",
+    heading: "Compile Hive",
     copy:
-      "Use the contributor dashboard to inspect queued run requests pulled from Redis. Each queued request includes the uploaded tar.gz artifact details and the matching SHA-256 hash that contributors can verify before future contributor actions load and run the image.",
+      "Inspect queued run requests from Redis. Each request carries the artifact location and SHA-256 hash that contributors can verify before later contributor actions run it.",
   },
 };
+
+const modeBurstTimers = new WeakMap<HTMLButtonElement, number>();
+const processLogTimers = new Set<number>();
+let nextProcessLogId = 1;
+let renderedProcessLogCount = 0;
 
 function getElement<T extends Element>(selector: string): T {
   const element = document.querySelector<T>(selector);
@@ -97,10 +120,14 @@ const workflowPanels = Array.from(
 );
 const selectedPath = getElement<HTMLElement>("#selected-path");
 const pickFolderButton = getElement<HTMLButtonElement>("#pick-folder");
-const createImageButton = getElement<HTMLButtonElement>("#create-image");
 const requestRunButton = getElement<HTMLButtonElement>("#request-run");
+const revealFolderButton =
+  getElement<HTMLButtonElement>("#reveal-folder");
 const clearSelectionButton =
   getElement<HTMLButtonElement>("#clear-selection");
+const processLog = getElement<HTMLElement>("#process-log");
+const processLogStatus =
+  getElement<HTMLElement>("#process-log-status");
 const bundleStatus = getElement<HTMLElement>("#bundle-status");
 const bundleSummaryTitle =
   getElement<HTMLElement>("#bundle-summary-title");
@@ -121,29 +148,63 @@ const buildNotes = getElement<HTMLUListElement>("#build-notes");
 const workerQueue = getElement<HTMLElement>("#worker-queue");
 const refreshWorkersButton =
   getElement<HTMLButtonElement>("#refresh-workers");
+const contributorSignupForm =
+  getElement<HTMLFormElement>("#contributor-signup-form");
+const contributorNameInput =
+  getElement<HTMLInputElement>("#contributor-name");
+const contributorEmailInput =
+  getElement<HTMLInputElement>("#contributor-email");
+const contributorLocationInput =
+  getElement<HTMLInputElement>("#contributor-location");
+const contributorSignupSubmit =
+  getElement<HTMLButtonElement>("#contributor-signup-submit");
+const contributorSetupStatus =
+  getElement<HTMLElement>("#contributor-setup-status");
+const contributorProfileCard =
+  getElement<HTMLElement>("#contributor-profile-card");
+const profileWorkerId =
+  getElement<HTMLElement>("#profile-worker-id");
+const profileContributorName =
+  getElement<HTMLElement>("#profile-contributor-name");
+const profileContributorEmail =
+  getElement<HTMLElement>("#profile-contributor-email");
+const profileContributorLocation =
+  getElement<HTMLElement>("#profile-contributor-location");
+const profileContributorResources =
+  getElement<HTMLElement>("#profile-contributor-resources");
 
 const state: {
   mode: Mode;
   selectedPath: string;
   buildStatus: BuildStatus;
-  activeAction: ActionKind;
   buildResult: DockerImageResult | null;
   runResult: RunRequestResult | null;
   error: string;
   contributorRequests: IncomingRunRequest[];
   contributorLoading: boolean;
   contributorError: string;
+  contributorProfile: ContributorWorkerProfile | null;
+  contributorSetupLoading: boolean;
+  contributorSetupMessage: string;
+  contributorSetupError: string;
+  logEntries: ProcessLogEntry[];
+  logStage: string;
 } = {
   mode: "user",
   selectedPath: "",
   buildStatus: "idle",
-  activeAction: "build",
   buildResult: null,
   runResult: null,
   error: "",
   contributorRequests: [],
   contributorLoading: false,
   contributorError: "",
+  contributorProfile: null,
+  contributorSetupLoading: false,
+  contributorSetupMessage: "",
+  contributorSetupError: "",
+  logEntries: [],
+  logStage: "Idle",
 };
 
 function formatBytes(bytes: number): string {
@@ -212,6 +273,24 @@ function appendQueueMetric(
   parent.append(block);
 }
 
+function triggerModeChipBurst(button: HTMLButtonElement): void {
+  const activeTimer = modeBurstTimers.get(button);
+  if (activeTimer) {
+    window.clearTimeout(activeTimer);
+  }
+
+  button.classList.remove("is-bursting");
+  void button.offsetWidth;
+  button.classList.add("is-bursting");
+
+  const timer = window.setTimeout(() => {
+    button.classList.remove("is-bursting");
+    modeBurstTimers.delete(button);
+  }, 720);
+
+  modeBurstTimers.set(button, timer);
+}
+
 function renderLink(
   element: HTMLAnchorElement,
   url: string,
@@ -236,9 +315,9 @@ function statusLabel(status: BuildStatus): string {
     case "ready":
       return "Ready";
     case "working":
-      return state.activeAction === "request" ? "Queueing" : "Building";
+      return "Processing";
     case "done":
-      return state.runResult ? "Queued" : "Built";
+      return "Queued";
     case "error":
       return "Attention";
   }
@@ -249,25 +328,19 @@ function statusHeadline(status: BuildStatus): string {
     case "idle":
       return "Waiting for a folder";
     case "ready":
-      return "Ready to build or request a run";
+      return "Ready to request a run";
     case "working":
-      return state.activeAction === "request"
-        ? "Preparing the tar.gz artifact and queueing the run"
-        : "Building the Docker image";
+      return "Building the Docker image and queueing the run";
     case "done":
-      return state.runResult
-        ? "Run request queued successfully"
-        : "Docker image created successfully";
+      return "Run request queued successfully";
     case "error":
-      return state.activeAction === "request"
-        ? "Run request needs attention"
-        : "Docker image creation needs attention";
+      return "Run request needs attention";
   }
 }
 
 function statusSummary(): string {
   if (state.error) {
-    return state.error;
+    return "There is an error. Check the terminal for more details.";
   }
 
   if (state.runResult) {
@@ -279,16 +352,14 @@ function statusSummary(): string {
   }
 
   if (state.buildStatus === "ready") {
-    return "The folder is selected. ComputeHive can either build the Docker image locally or build it, compress it to tar.gz, upload it, and queue the related Redis records for a contributor run.";
+    return "The folder is selected. Request for run will build the image, compress it, upload it, and queue the run.";
   }
 
   if (state.buildStatus === "working") {
-    return state.activeAction === "request"
-      ? "ComputeHive is generating Docker setup if needed, building the image, compressing it to tar.gz, hashing the artifact, uploading it to object storage, and writing the Redis queue records."
-      : "ComputeHive is checking the project for Docker setup, generating missing Docker files, then building and exporting the image into the selected project root.";
+    return "ComputeHive is preparing the Docker image, packaging the artifact, and queueing the run.";
   }
 
-  return "Pick a project directory and let the app build locally or request a queued run with an uploaded tar.gz artifact.";
+  return "Pick a project directory to prepare the Docker image and queue the run.";
 }
 
 function renderBuildNotes(notes: string[]): void {
@@ -306,6 +377,204 @@ function renderBuildNotes(notes: string[]): void {
     const item = document.createElement("li");
     item.textContent = note;
     buildNotes.append(item);
+  });
+}
+
+function processLogToneForStatus(status: BuildStatus): string {
+  switch (status) {
+    case "working":
+      return "working";
+    case "done":
+      return "done";
+    case "error":
+      return "error";
+    default:
+      return "idle";
+  }
+}
+
+function processLogTimestamp(): string {
+  return new Intl.DateTimeFormat(undefined, {
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  }).format(new Date());
+}
+
+function createProcessLogLine(entry: ProcessLogEntry): HTMLElement {
+  const line = document.createElement("div");
+  line.className = `terminal-line terminal-line-${entry.tone}`;
+
+  const time = document.createElement("span");
+  time.className = "terminal-time";
+  time.textContent = entry.timestamp;
+
+  const prompt = document.createElement("span");
+  prompt.className = "terminal-prompt";
+  prompt.textContent = entry.tone === "error" ? "!" : entry.tone === "success" ? "+" : ">";
+
+  const message = document.createElement("p");
+  message.className = "terminal-message";
+  message.textContent = entry.message;
+
+  line.append(time, prompt, message);
+  return line;
+}
+
+function renderProcessLog(forceReset = false): void {
+  processLogStatus.textContent = state.logStage;
+  processLogStatus.className =
+    `terminal-status terminal-status-${processLogToneForStatus(state.buildStatus)}`;
+
+  if (forceReset || state.logEntries.length < renderedProcessLogCount) {
+    processLog.replaceChildren();
+    renderedProcessLogCount = 0;
+  }
+
+  if (state.logEntries.length === 0) {
+    const placeholder = document.createElement("p");
+    placeholder.className = "terminal-placeholder";
+    placeholder.textContent =
+      state.selectedPath.length > 0
+        ? "Request for run will build the Docker image, compress it, upload it, and queue the job."
+        : "Select a project folder to let ComputeHive build the Docker image and request the run.";
+    processLog.replaceChildren(placeholder);
+    renderedProcessLogCount = 0;
+    return;
+  }
+
+  if (renderedProcessLogCount === 0) {
+    processLog.replaceChildren();
+  }
+
+  while (renderedProcessLogCount < state.logEntries.length) {
+    processLog.append(
+      createProcessLogLine(state.logEntries[renderedProcessLogCount]),
+    );
+    renderedProcessLogCount += 1;
+  }
+
+  processLog.scrollTop = processLog.scrollHeight;
+}
+
+function addProcessLog(
+  tone: ProcessLogTone,
+  message: string,
+): void {
+  state.logEntries.push({
+    id: nextProcessLogId,
+    tone,
+    message,
+    timestamp: processLogTimestamp(),
+  });
+  nextProcessLogId += 1;
+  renderProcessLog();
+}
+
+function clearProcessLogTimers(): void {
+  processLogTimers.forEach((timer) => window.clearTimeout(timer));
+  processLogTimers.clear();
+}
+
+function scheduleProcessLog(
+  delayMs: number,
+  tone: ProcessLogTone,
+  message: string,
+): void {
+  const timer = window.setTimeout(() => {
+    processLogTimers.delete(timer);
+    addProcessLog(tone, message);
+  }, delayMs);
+
+  processLogTimers.add(timer);
+}
+
+function resetProcessLog(stage: string): void {
+  clearProcessLogTimers();
+  state.logStage = stage;
+  state.logEntries = [];
+  renderProcessLog(true);
+}
+
+function stageRequestLog(): void {
+  resetProcessLog("Preparing");
+  addProcessLog("info", `Target folder: ${state.selectedPath}`);
+  addProcessLog("working", "Inspecting the selected project root.");
+  scheduleProcessLog(
+    180,
+    "working",
+    "Checking whether a Dockerfile already exists.",
+  );
+  scheduleProcessLog(
+    380,
+    "working",
+    "Checking whether a .dockerignore file already exists.",
+  );
+  addProcessLog(
+    "working",
+    "Resolving the project stack and build strategy.",
+  );
+  scheduleProcessLog(
+    720,
+    "working",
+    "Generating missing Docker setup files when required.",
+  );
+  scheduleProcessLog(
+    1240,
+    "working",
+    "Building the Docker image.",
+  );
+  scheduleProcessLog(
+    1820,
+    "working",
+    "Exporting the Docker image archive into the project root.",
+  );
+  scheduleProcessLog(
+    2420,
+    "working",
+    "Compressing the archive to tar.gz.",
+  );
+  scheduleProcessLog(
+    3020,
+    "working",
+    "Calculating the SHA-256 artifact hash.",
+  );
+  scheduleProcessLog(
+    3620,
+    "working",
+    "Uploading the artifact to object storage.",
+  );
+  scheduleProcessLog(
+    4220,
+    "working",
+    "Writing the Redis job record and queue entry.",
+  );
+}
+
+function appendResultLogs(result: RunRequestResult): void {
+  clearProcessLogTimers();
+  state.logStage = "Queued";
+  addProcessLog("success", `Docker image ready: ${result.image.imageTag}`);
+  addProcessLog(
+    "success",
+    `Compressed artifact stored at ${result.gzipArchivePath}.`,
+  );
+  addProcessLog(
+    "success",
+    `Artifact SHA-256 recorded as ${result.artifactSha256}.`,
+  );
+  addProcessLog(
+    "success",
+    `Redis job ${result.redisJobId} was queued with object key ${result.artifactObjectKey}.`,
+  );
+
+  const seen = new Set<string>();
+  result.notes.forEach((note) => {
+    if (seen.has(note)) {
+      return;
+    }
+    seen.add(note);
+    addProcessLog(note.includes("No container") ? "info" : "success", note);
   });
 }
 
@@ -393,6 +662,49 @@ function renderContributorQueue(): void {
   });
 }
 
+function renderContributorSetup(): void {
+  contributorSignupSubmit.disabled = state.contributorSetupLoading;
+  contributorSignupSubmit.textContent = state.contributorSetupLoading
+    ? "Setting up contributor..."
+    : "Sign up as contributor";
+
+  if (state.contributorSetupError) {
+    contributorSetupStatus.textContent = state.contributorSetupError;
+    contributorSetupStatus.classList.add("contributor-status-error");
+    contributorSetupStatus.classList.remove("contributor-status-success");
+  } else if (state.contributorSetupMessage) {
+    contributorSetupStatus.textContent = state.contributorSetupMessage;
+    contributorSetupStatus.classList.add("contributor-status-success");
+    contributorSetupStatus.classList.remove("contributor-status-error");
+  } else {
+    contributorSetupStatus.textContent =
+      "Fill the form to register this machine as a contributor worker.";
+    contributorSetupStatus.classList.remove(
+      "contributor-status-success",
+      "contributor-status-error",
+    );
+  }
+
+  const profile = state.contributorProfile;
+  contributorProfileCard.hidden = !profile;
+  if (!profile) {
+    profileWorkerId.textContent = "Pending";
+    profileContributorName.textContent = "Pending";
+    profileContributorEmail.textContent = "Pending";
+    profileContributorLocation.textContent = "Pending";
+    profileContributorResources.textContent =
+      "CPU: - · GPU: - · Memory: - · Storage: -";
+    return;
+  }
+
+  profileWorkerId.textContent = profile.workerId;
+  profileContributorName.textContent = `${profile.name} · ${profile.workerVersion}`;
+  profileContributorEmail.textContent = profile.email;
+  profileContributorLocation.textContent = profile.location;
+  profileContributorResources.textContent =
+    `CPU: ${profile.availableCpuCores} cores · GPU: ${profile.availableGpuCount} · Memory: ${profile.availableMemoryMb} MB · Storage: ${profile.availableStorageGb} GB`;
+}
+
 function renderMode(): void {
   const copy = interfaceCopy[state.mode];
   modeEyebrow.textContent = copy.eyebrow;
@@ -410,6 +722,8 @@ function renderMode(): void {
     panel.classList.toggle("is-active", active);
     panel.hidden = !active;
   });
+
+  renderContributorSetup();
 }
 
 function renderUserState(): void {
@@ -418,17 +732,13 @@ function renderUserState(): void {
 
   const canAct =
     state.selectedPath.length > 0 && state.buildStatus !== "working";
-  createImageButton.disabled = !canAct;
   requestRunButton.disabled = !canAct;
+  revealFolderButton.disabled = state.selectedPath.length === 0;
   pickFolderButton.disabled = state.buildStatus === "working";
   clearSelectionButton.disabled = state.buildStatus === "working";
 
-  createImageButton.textContent =
-    state.buildStatus === "working" && state.activeAction === "build"
-      ? "Creating Docker image..."
-      : "Create Docker image";
   requestRunButton.textContent =
-    state.buildStatus === "working" && state.activeAction === "request"
+    state.buildStatus === "working"
       ? "Requesting run..."
       : "Request for run";
 
@@ -436,6 +746,7 @@ function renderUserState(): void {
   bundleStatus.textContent = statusLabel(state.buildStatus);
   bundleSummaryTitle.textContent = statusHeadline(state.buildStatus);
   bundleSummary.textContent = statusSummary();
+  renderProcessLog();
 
   const imageDetails = state.buildResult ?? state.runResult?.image ?? null;
   if (imageDetails) {
@@ -486,59 +797,67 @@ function renderUserState(): void {
 
   renderBuildNotes([
     "The app creates Docker setup files automatically when they are missing.",
-    "The local build action does not upload anything.",
-    "The run request action uploads only the tar.gz image artifact.",
-    "No container is created by either action in this build.",
+    "Request for run first builds the Docker image inside the selected project root.",
+    "The app uploads only the tar.gz image artifact after compression.",
+    "No container is created by this action in the current build.",
   ]);
 }
 
-async function pickProjectFolder(): Promise<void> {
-  const folder = await open({
-    directory: true,
-    multiple: false,
-    title: "Select the project folder to Dockerize and queue",
-  });
-
-  if (typeof folder !== "string") {
-    return;
-  }
-
-  state.selectedPath = folder;
-  state.buildStatus = "ready";
-  state.buildResult = null;
-  state.runResult = null;
-  state.error = "";
-  renderUserState();
-}
-
-async function createProjectDockerImage(): Promise<void> {
+function openSelectedFolder(): void {
   if (!state.selectedPath) {
     return;
   }
 
-  state.activeAction = "build";
-  state.buildStatus = "working";
-  state.buildResult = null;
-  state.runResult = null;
+  addProcessLog("working", "Opening the selected project folder in the system file browser.");
+  openPath(state.selectedPath)
+    .then(() => {
+      addProcessLog("success", "Selected project folder opened.");
+    })
+    .catch((error) => {
+      const message = error instanceof Error ? error.message : String(error);
+      addProcessLog("error", `Could not open the selected folder: ${message}`);
+    });
+}
+
+function pickProjectFolder(): void {
   state.error = "";
+  resetProcessLog("Picker");
+  addProcessLog("working", "Opening the native folder picker.");
   renderUserState();
 
-  try {
-    const result = await invoke<DockerImageResult>(
-      "create_project_docker_image",
-      {
-        projectPath: state.selectedPath,
-      },
-    );
+  open({
+    directory: true,
+    multiple: false,
+    title: "Select the project folder to Dockerize and queue",
+  })
+    .then((folder) => {
+      if (typeof folder !== "string") {
+        state.logStage = "Idle";
+        addProcessLog("info", "Folder selection was canceled.");
+        renderUserState();
+        return;
+      }
 
-    state.buildResult = result;
-    state.buildStatus = "done";
-  } catch (error) {
-    state.error = error instanceof Error ? error.message : String(error);
-    state.buildStatus = "error";
-  }
-
-  renderUserState();
+      state.selectedPath = folder;
+      state.buildStatus = "ready";
+      state.buildResult = null;
+      state.runResult = null;
+      state.error = "";
+      resetProcessLog("Ready");
+      addProcessLog("info", `Project folder selected: ${folder}`);
+      addProcessLog(
+        "info",
+        "Request for run will handle Docker setup, image export, compression, upload, and Redis queueing in one pass.",
+      );
+      renderUserState();
+    })
+    .catch((error) => {
+      state.buildStatus = state.selectedPath ? "ready" : "idle";
+      state.error = error instanceof Error ? error.message : String(error);
+      state.logStage = "Picker Error";
+      addProcessLog("error", `Folder picker failed: ${state.error}`);
+      renderUserState();
+    });
 }
 
 async function requestProjectRun(): Promise<void> {
@@ -546,11 +865,11 @@ async function requestProjectRun(): Promise<void> {
     return;
   }
 
-  state.activeAction = "request";
   state.buildStatus = "working";
   state.buildResult = null;
   state.runResult = null;
   state.error = "";
+  stageRequestLog();
   renderUserState();
 
   try {
@@ -561,10 +880,14 @@ async function requestProjectRun(): Promise<void> {
     state.buildResult = result.image;
     state.runResult = result;
     state.buildStatus = "done";
+    appendResultLogs(result);
     void refreshContributorQueue();
   } catch (error) {
+    clearProcessLogTimers();
     state.error = error instanceof Error ? error.message : String(error);
     state.buildStatus = "error";
+    state.logStage = "Failed";
+    addProcessLog("error", state.error);
   }
 
   renderUserState();
@@ -590,18 +913,81 @@ async function refreshContributorQueue(): Promise<void> {
   }
 }
 
+async function loadContributorProfile(): Promise<void> {
+  try {
+    const profile = await invoke<ContributorWorkerProfile | null>(
+      "get_registered_contributor_worker",
+    );
+    state.contributorProfile = profile;
+    if (profile && !state.contributorSetupMessage) {
+      state.contributorSetupMessage =
+        "Contributor setup already exists for this machine.";
+    }
+  } catch (error) {
+    state.contributorProfile = null;
+    state.contributorSetupError =
+      error instanceof Error ? error.message : String(error);
+  }
+
+  renderContributorSetup();
+}
+
+async function setupContributorWorker(): Promise<void> {
+  const name = contributorNameInput.value.trim();
+  const email = contributorEmailInput.value.trim();
+  const location = contributorLocationInput.value.trim();
+
+  if (!name || !email || !location) {
+    state.contributorSetupError =
+      "Name, email, and location are required to register as a contributor.";
+    state.contributorSetupMessage = "";
+    renderContributorSetup();
+    return;
+  }
+
+  state.contributorSetupLoading = true;
+  state.contributorSetupError = "";
+  state.contributorSetupMessage = "";
+  renderContributorSetup();
+
+  try {
+    const profile = await invoke<ContributorWorkerProfile>(
+      "setup_contributor_worker",
+      {
+        name,
+        email,
+        location,
+      },
+    );
+
+    state.contributorProfile = profile;
+    state.contributorSetupMessage =
+      "Contributor setup completed and worker details were stored in Redis.";
+    contributorSignupForm.reset();
+  } catch (error) {
+    state.contributorSetupError =
+      error instanceof Error ? error.message : String(error);
+  } finally {
+    state.contributorSetupLoading = false;
+    renderContributorSetup();
+  }
+}
+
 function clearSelection(): void {
+  clearProcessLogTimers();
   state.selectedPath = "";
   state.buildStatus = "idle";
-  state.activeAction = "build";
   state.buildResult = null;
   state.runResult = null;
   state.error = "";
+  state.logStage = "Idle";
+  state.logEntries = [];
   renderUserState();
 }
 
 modeButtons.forEach((button) => {
   button.addEventListener("click", () => {
+    triggerModeChipBurst(button);
     const nextMode = button.dataset.mode;
     if (nextMode === "user" || nextMode === "contributor") {
       state.mode = nextMode;
@@ -614,23 +1000,30 @@ modeButtons.forEach((button) => {
 });
 
 pickFolderButton.addEventListener("click", () => {
-  void pickProjectFolder();
-});
-
-createImageButton.addEventListener("click", () => {
-  void createProjectDockerImage();
+  pickProjectFolder();
 });
 
 requestRunButton.addEventListener("click", () => {
   void requestProjectRun();
 });
 
+revealFolderButton.addEventListener("click", () => {
+  openSelectedFolder();
+});
+
 refreshWorkersButton.addEventListener("click", () => {
   void refreshContributorQueue();
+});
+
+contributorSignupForm.addEventListener("submit", (event) => {
+  event.preventDefault();
+  void setupContributorWorker();
 });
 
 clearSelectionButton.addEventListener("click", clearSelection);
 
 renderMode();
 renderUserState();
+renderContributorSetup();
 void refreshContributorQueue();
+void loadContributorProfile();

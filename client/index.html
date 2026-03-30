@@ -19,15 +19,13 @@
       <header class="masthead reveal">
         <div class="brand-column">
           <p class="eyebrow" id="mode-eyebrow">Project Image Flow</p>
-          <h1 id="mode-heading">
-            Build locally, then request a queued run with a hashed tar.gz artifact.
-          </h1>
+          <div class="title-orbit">
+            <h1 id="mode-heading">Compile Hive</h1>
+          </div>
           <p class="lead" id="mode-copy">
-            Choose a project directory and let ComputeHive generate Docker setup
-            when it is missing. You can build the Docker image locally, then
-            request a run so the app compresses the image to a tar.gz artifact,
-            hashes it, uploads it to object storage, and writes the queue
-            records into Redis.
+            Choose a project directory. ComputeHive prepares Docker when needed,
+            builds the image, compresses it, uploads the artifact, and queues
+            the run request.
           </p>
         </div>
 
@@ -56,7 +54,7 @@
           <div class="panel-header">
             <div>
               <p class="eyebrow">Image Builder</p>
-              <h2>Folder input, Docker setup, image creation, and run requests</h2>
+              <h2>Folder input, Docker setup, image creation, and run request</h2>
             </div>
 
             <button id="clear-selection" class="ghost-button" type="button">
@@ -70,12 +68,9 @@
                 <p class="upload-kicker">Project Directory</p>
                 <h3>Choose the project folder you want the app to Dockerize</h3>
                 <p class="support-copy">
-                  ComputeHive checks for Docker setup in the selected project,
-                  creates Docker files when they are missing, builds the Docker
-                  image locally, and saves the image as a tar archive inside
-                  that same project root. Use the second action when you want
-                  the app to compress that image to a tar.gz artifact, hash it,
-                  upload it, and enqueue the Redis run request.
+                  ComputeHive inspects the selected project, fills in Docker
+                  setup if it is missing, builds the image locally, compresses
+                  the exported archive, and queues the run request.
                 </p>
 
                 <button id="pick-folder" class="primary-button" type="button">
@@ -88,39 +83,56 @@
               </div>
 
               <div class="action-row">
-                <div class="button-group">
-                  <button
-                    id="create-image"
-                    class="primary-button"
-                    type="button"
-                    disabled
-                  >
-                    Create Docker image
-                  </button>
+                <div class="button-group button-group-single">
                   <button
                     id="request-run"
-                    class="ghost-button"
+                    class="primary-button"
                     type="button"
                     disabled
                   >
                     Request for run
                   </button>
+                  <button
+                    id="reveal-folder"
+                    class="ghost-button"
+                    type="button"
+                    disabled
+                  >
+                    Open selected folder
+                  </button>
                 </div>
-                <p class="action-copy">
-                  The first action stays local. The second action builds if
-                  needed, compresses the Docker image to a tar.gz file in the
-                  same project root, uploads it to object storage, and creates
-                  the coordinator queue records in Redis with the matching
-                  SHA-256 hash.
-                </p>
               </div>
+
+              <section class="terminal-shell" aria-label="Request log">
+                <div class="terminal-toolbar">
+                  <div class="terminal-dots" aria-hidden="true">
+                    <span></span>
+                    <span></span>
+                    <span></span>
+                  </div>
+                  <strong class="terminal-title">Request log</strong>
+                  <span
+                    id="process-log-status"
+                    class="terminal-status terminal-status-idle"
+                  >
+                    Idle
+                  </span>
+                </div>
+
+                <div id="process-log" class="terminal-output" aria-live="polite">
+                  <p class="terminal-placeholder">
+                    Select a project folder to let ComputeHive build the Docker
+                    image and request the run.
+                  </p>
+                </div>
+              </section>
             </div>
 
             <div class="status-region">
               <div class="status-card">
                 <div class="status-head">
                   <div>
-                    <p class="eyebrow">Image Status</p>
+                    <p class="eyebrow">Request Status</p>
                     <h3 id="bundle-summary-title">Waiting for a folder</h3>
                   </div>
                   <span id="bundle-status" class="status-pill status-idle">
@@ -128,8 +140,9 @@
                   </span>
                 </div>
 
-                <p id="bundle-summary" class="support-copy">
-                  Pick a project directory and let the app prepare Docker setup, build the image, and optionally queue a run request with an uploaded tar.gz artifact.
+                <p id="bundle-summary" class="support-copy bundle-summary-text">
+                  Pick a project directory and let the app prepare Docker setup,
+                  build the image, and queue the uploaded tar.gz artifact.
                 </p>
 
                 <div class="metric-grid">
@@ -196,8 +209,8 @@
                     <span class="detail-label">Build notes</span>
                     <ul id="build-notes" class="detail-list">
                       <li>The app creates Docker setup files automatically when they are missing.</li>
-                      <li>The local build action does not upload anything.</li>
-                      <li>The run request action uploads only the tar.gz image artifact.</li>
+                      <li>Request for run first builds the Docker image in the selected project root.</li>
+                      <li>The app uploads only the tar.gz image artifact after compression.</li>
                       <li>No container is created by this action.</li>
                     </ul>
                   </div>
@@ -234,31 +247,75 @@
 
             <aside class="contributor-aside">
               <div class="future-block">
-                <p class="eyebrow">Reserved Feature</p>
-                <h3>Contributor Actions</h3>
+                <p class="eyebrow">Contributor Actions</p>
+                <h3>Sign up this machine as a contributor</h3>
                 <p class="support-copy">
-                  Dockerization, container creation, and local worker execution
-                  are intentionally deferred in this pass. The UI keeps that
-                  capability visible without implementing it yet.
+                  Register basic contributor details so this machine is tracked
+                  in Redis as a worker. CPU, GPU, memory, and storage values
+                  are hardcoded for now to unblock the contributor setup flow.
                 </p>
 
-                <button class="ghost-button" type="button" disabled>
-                  Contributor Actions coming later
-                </button>
+                <form id="contributor-signup-form" class="contributor-form">
+                  <label class="contributor-label" for="contributor-name">Full name</label>
+                  <input
+                    id="contributor-name"
+                    class="contributor-input"
+                    type="text"
+                    placeholder="Jane Doe"
+                    autocomplete="name"
+                    required
+                  />
+
+                  <label class="contributor-label" for="contributor-email">Email</label>
+                  <input
+                    id="contributor-email"
+                    class="contributor-input"
+                    type="email"
+                    placeholder="jane@example.com"
+                    autocomplete="email"
+                    required
+                  />
+
+                  <label class="contributor-label" for="contributor-location">Location</label>
+                  <input
+                    id="contributor-location"
+                    class="contributor-input"
+                    type="text"
+                    placeholder="Chennai"
+                    autocomplete="address-level2"
+                    required
+                  />
+
+                  <button id="contributor-signup-submit" class="primary-button" type="submit">
+                    Sign up as contributor
+                  </button>
+                </form>
+
+                <p id="contributor-setup-status" class="support-copy contributor-setup-status">
+                  Fill the form to register this machine as a contributor worker.
+                </p>
               </div>
 
-              <div class="future-notes">
+              <div id="contributor-profile-card" class="future-notes contributor-profile" hidden>
                 <div class="note-row">
-                  <span class="note-label">Worker intake</span>
-                  <p>Show the code package, size, and current readiness.</p>
+                  <span class="note-label">Worker id</span>
+                  <p id="profile-worker-id">Pending</p>
                 </div>
                 <div class="note-row">
-                  <span class="note-label">Local execution</span>
-                  <p>Will later create containers only on the contributor machine.</p>
+                  <span class="note-label">Contributor</span>
+                  <p id="profile-contributor-name">Pending</p>
                 </div>
                 <div class="note-row">
-                  <span class="note-label">Current state</span>
-                  <p>Dashboard only. No Docker implementation in this build.</p>
+                  <span class="note-label">Email</span>
+                  <p id="profile-contributor-email">Pending</p>
+                </div>
+                <div class="note-row">
+                  <span class="note-label">Location</span>
+                  <p id="profile-contributor-location">Pending</p>
+                </div>
+                <div class="note-row">
+                  <span class="note-label">Hardcoded resources</span>
+                  <p id="profile-contributor-resources">CPU: - · GPU: - · Memory: - · Storage: -</p>
                 </div>
               </div>
             </aside>

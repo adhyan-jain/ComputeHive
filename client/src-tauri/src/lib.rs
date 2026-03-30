@@ -1,12 +1,13 @@
 use flate2::{write::GzEncoder, Compression};
+use hmac::{Hmac, Mac};
 use redis::Commands;
-use reqwest::blocking::{Body as ReqwestBody, Client as BlockingHttpClient};
-use rusty_s3::{Bucket, Credentials as S3Credentials, S3Action, UrlStyle};
+use reqwest::blocking::Client as BlockingHttpClient;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
+    error::Error as StdError,
     fs::{self, File},
     io::{self, BufReader, BufWriter, ErrorKind, Read},
     path::{Path, PathBuf},
@@ -15,17 +16,28 @@ use std::{
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+use time::{macros::format_description, OffsetDateTime};
 use url::Url;
 use uuid::Uuid;
 
 const JOB_QUEUE_KEY: &str = "job_queue";
+const WORKERS_KEY: &str = "workers";
 const JOB_STATUS_QUEUED: &str = "queued";
 const ARTIFACT_RECORD_PREFIX: &str = "computehive_job_artifact:";
+const CONTRIBUTOR_PROFILE_PREFIX: &str = "computehive_contributor_profile:";
+const CONTRIBUTOR_ACTIVE_WORKER_KEY: &str = "computehive_active_contributor_worker";
 const DEFAULT_MAX_RUNTIME_SECONDS: i32 = 3600;
 const DEFAULT_REQUIRED_CPU_CORES: i32 = 1;
 const DEFAULT_REQUIRED_GPU_COUNT: i32 = 0;
 const DEFAULT_REQUIRED_MEMORY_MB: i32 = 1024;
 const DEFAULT_R2_REGION: &str = "auto";
+const DEFAULT_CONTRIBUTOR_CPU_CORES: i32 = 8;
+const DEFAULT_CONTRIBUTOR_GPU_COUNT: i32 = 1;
+const DEFAULT_CONTRIBUTOR_MEMORY_MB: i32 = 16384;
+const DEFAULT_CONTRIBUTOR_STORAGE_GB: i32 = 256;
+const DEFAULT_CONTRIBUTOR_WORKER_VERSION: &str = "computehive-contributor-v0";
+const EMPTY_PAYLOAD_SHA256: &str =
+    "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
 static APP_CONFIG: OnceLock<Result<AppConfig, String>> = OnceLock::new();
 static ENV_FILE_LOADED: OnceLock<()> = OnceLock::new();
@@ -144,11 +156,20 @@ struct ObjectStorageConfig {
     region: String,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 struct RedisResourceSpec {
     cpu_cores: i32,
     gpu_count: i32,
     memory_mb: i32,
+}
+
+#[derive(Serialize, Deserialize)]
+struct RedisWorkerRecord {
+    id: String,
+    available_resources: Option<RedisResourceSpec>,
+    worker_version: String,
+    registered_at_unix: i64,
+    last_heartbeat_unix: i64,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -162,6 +183,32 @@ struct RedisJobRecord {
     status: String,
     created_at_unix: i64,
     assigned_worker_id: String,
+}
+
+#[derive(Serialize, Deserialize)]
+struct RedisContributorProfileRecord {
+    worker_id: String,
+    name: String,
+    email: String,
+    location: String,
+    worker_version: String,
+    available_resources: RedisResourceSpec,
+    available_storage_gb: i32,
+    registered_at_unix: i64,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ContributorWorkerProfile {
+    worker_id: String,
+    name: String,
+    email: String,
+    location: String,
+    worker_version: String,
+    available_cpu_cores: i32,
+    available_gpu_count: i32,
+    available_memory_mb: i32,
+    available_storage_gb: i32,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -191,6 +238,11 @@ struct UploadedArtifact {
     artifact_public_url: String,
     artifact_object_key: String,
     artifact_etag: Option<String>,
+}
+
+struct SignedObjectStorageRequest {
+    url: String,
+    headers: Vec<(String, String)>,
 }
 
 enum DockerInfoStatus {
@@ -430,6 +482,128 @@ fn list_incoming_run_requests() -> Result<Vec<IncomingRunRequest>, String> {
     }
 
     Ok(requests)
+}
+
+#[tauri::command]
+fn setup_contributor_worker(
+    name: String,
+    email: String,
+    location: String,
+) -> Result<ContributorWorkerProfile, String> {
+    let name = name.trim().to_string();
+    let email = email.trim().to_string();
+    let location = location.trim().to_string();
+
+    if name.is_empty() {
+        return Err("Contributor name is required.".to_string());
+    }
+    if email.is_empty() {
+        return Err("Contributor email is required.".to_string());
+    }
+    if location.is_empty() {
+        return Err("Contributor location is required.".to_string());
+    }
+
+    let config = app_config()?;
+    let client = redis::Client::open(config.redis_url.as_str())
+        .map_err(|error| format!("Failed to parse the Redis URL: {error}"))?;
+    let mut connection = client
+        .get_connection()
+        .map_err(|error| format!("Failed to connect to Redis: {error}"))?;
+
+    let registered_at_unix = current_unix_timestamp();
+    let worker_id = Uuid::new_v4().to_string();
+    let available_resources = RedisResourceSpec {
+        cpu_cores: DEFAULT_CONTRIBUTOR_CPU_CORES,
+        gpu_count: DEFAULT_CONTRIBUTOR_GPU_COUNT,
+        memory_mb: DEFAULT_CONTRIBUTOR_MEMORY_MB,
+    };
+
+    let worker_record = RedisWorkerRecord {
+        id: worker_id.clone(),
+        available_resources: Some(available_resources.clone()),
+        worker_version: DEFAULT_CONTRIBUTOR_WORKER_VERSION.to_string(),
+        registered_at_unix,
+        last_heartbeat_unix: registered_at_unix,
+    };
+    let profile_record = RedisContributorProfileRecord {
+        worker_id: worker_id.clone(),
+        name,
+        email,
+        location,
+        worker_version: DEFAULT_CONTRIBUTOR_WORKER_VERSION.to_string(),
+        available_resources,
+        available_storage_gb: DEFAULT_CONTRIBUTOR_STORAGE_GB,
+        registered_at_unix,
+    };
+
+    let worker_payload = serde_json::to_string(&worker_record)
+        .map_err(|error| format!("Failed to serialize worker record: {error}"))?;
+    let profile_payload = serde_json::to_string(&profile_record)
+        .map_err(|error| format!("Failed to serialize contributor profile: {error}"))?;
+
+    redis::pipe()
+        .atomic()
+        .sadd(WORKERS_KEY, &worker_id)
+        .ignore()
+        .set(redis_worker_key(&worker_id), worker_payload)
+        .ignore()
+        .set(redis_worker_alive_key(&worker_id), "1")
+        .ignore()
+        .set(contributor_profile_key(&worker_id), profile_payload)
+        .ignore()
+        .set(CONTRIBUTOR_ACTIVE_WORKER_KEY, &worker_id)
+        .ignore()
+        .query::<()>(&mut connection)
+        .map_err(|error| format!("Failed to store contributor worker in Redis: {error}"))?;
+
+    Ok(to_contributor_worker_profile(&profile_record))
+}
+
+#[tauri::command]
+fn get_registered_contributor_worker() -> Result<Option<ContributorWorkerProfile>, String> {
+    let config = app_config()?;
+    let client = redis::Client::open(config.redis_url.as_str())
+        .map_err(|error| format!("Failed to parse the Redis URL: {error}"))?;
+    let mut connection = client
+        .get_connection()
+        .map_err(|error| format!("Failed to connect to Redis: {error}"))?;
+
+    let active_worker_id = connection
+        .get::<_, Option<String>>(CONTRIBUTOR_ACTIVE_WORKER_KEY)
+        .map_err(|error| {
+            format!(
+                "Failed to load contributor pointer {}: {error}",
+                CONTRIBUTOR_ACTIVE_WORKER_KEY
+            )
+        })?;
+
+    let Some(worker_id) = active_worker_id else {
+        return Ok(None);
+    };
+
+    let profile_payload = connection
+        .get::<_, Option<String>>(contributor_profile_key(&worker_id))
+        .map_err(|error| {
+            format!(
+                "Failed to load contributor profile {}: {error}",
+                contributor_profile_key(&worker_id)
+            )
+        })?;
+
+    let Some(profile_payload) = profile_payload else {
+        return Ok(None);
+    };
+
+    let profile_record: RedisContributorProfileRecord = serde_json::from_str(&profile_payload)
+        .map_err(|error| {
+            format!(
+                "Failed to parse contributor profile {}: {error}",
+                contributor_profile_key(&worker_id)
+            )
+        })?;
+
+    Ok(Some(to_contributor_worker_profile(&profile_record)))
 }
 
 fn build_project_docker_image(project_path: &str) -> Result<DockerImageResult, String> {
@@ -1155,14 +1329,22 @@ async fn delete_artifact_from_object_storage(
     let object_key = object_key.to_string();
 
     tauri::async_runtime::spawn_blocking(move || {
-        let (bucket, credentials) = object_storage_bucket(&config.object_storage)?;
-        let action = bucket.delete_object(Some(&credentials), &object_key);
-        let signed_url = action.sign(Duration::from_secs(900));
-        let response = BlockingHttpClient::new()
-            .delete(signed_url)
+        let signed_request = sign_object_storage_request(
+            &config.object_storage,
+            "DELETE",
+            &object_key,
+            EMPTY_PAYLOAD_SHA256,
+            &[],
+        )?;
+        let response = build_object_storage_http_client()?
+            .delete(&signed_request.url)
+            .headers(reqwest_headers(&signed_request.headers)?)
             .send()
             .map_err(|error| {
-                format!("Failed to delete the uploaded artifact from object storage: {error}")
+                format!(
+                    "Failed to delete the uploaded artifact from object storage: {}",
+                    format_reqwest_error(&error)
+                )
             })?;
 
         if response.status().is_success() || response.status().as_u16() == 404 {
@@ -1188,25 +1370,36 @@ fn upload_artifact_to_object_storage_blocking(
     object_key: &str,
     artifact_sha256: &str,
 ) -> Result<UploadedArtifact, String> {
-    let (bucket, credentials) = object_storage_bucket(&config.object_storage)?;
-    let mut action = bucket.put_object(Some(&credentials), object_key);
-    action
-        .headers_mut()
-        .insert("content-type", "application/gzip");
-    action
-        .headers_mut()
-        .insert("x-amz-meta-artifact-sha256", artifact_sha256);
-    let signed_url = action.sign(Duration::from_secs(900));
+    let artifact_size_bytes = fs::metadata(artifact_path)
+        .map_err(|error| format!("Failed to inspect the compressed artifact for upload: {error}"))?
+        .len();
 
     let file = File::open(artifact_path)
         .map_err(|error| format!("Failed to open the compressed artifact for upload: {error}"))?;
-    let response = BlockingHttpClient::new()
-        .put(signed_url)
-        .header("content-type", "application/gzip")
-        .header("x-amz-meta-artifact-sha256", artifact_sha256)
-        .body(ReqwestBody::from(file))
+
+    let signed_request = sign_object_storage_request(
+        &config.object_storage,
+        "PUT",
+        object_key,
+        artifact_sha256,
+        &[
+            ("content-type", "application/gzip"),
+            ("x-amz-meta-artifact-sha256", artifact_sha256),
+        ],
+    )?;
+
+    let response = build_object_storage_http_client()?
+        .put(&signed_request.url)
+        .headers(reqwest_headers(&signed_request.headers)?)
+        .header("content-length", artifact_size_bytes.to_string())
+        .body(file)
         .send()
-        .map_err(|error| format!("Failed to upload the artifact to object storage: {error}"))?;
+        .map_err(|error| {
+            format!(
+                "Failed to upload the artifact to object storage: {}",
+                format_reqwest_error(&error)
+            )
+        })?;
 
     if !response.status().is_success() {
         let status = response.status();
@@ -1235,22 +1428,212 @@ fn upload_artifact_to_object_storage_blocking(
     })
 }
 
-fn object_storage_bucket(config: &ObjectStorageConfig) -> Result<(Bucket, S3Credentials), String> {
+fn sign_object_storage_request(
+    config: &ObjectStorageConfig,
+    method: &str,
+    object_key: &str,
+    payload_sha256: &str,
+    extra_headers: &[(&str, &str)],
+) -> Result<SignedObjectStorageRequest, String> {
     let endpoint = Url::parse(&config.endpoint_url)
         .map_err(|error| format!("Failed to parse the object storage endpoint: {error}"))?;
-    let bucket = Bucket::new(
-        endpoint,
-        UrlStyle::Path,
-        config.bucket_name.clone(),
-        config.region.clone(),
-    )
-    .map_err(|error| format!("Failed to create the object storage bucket client: {error}"))?;
-    let credentials = S3Credentials::new(
-        config.access_key_id.clone(),
-        config.secret_access_key.clone(),
+    let host = endpoint_host_header(&endpoint)?;
+    let object_key = object_key.trim_start_matches('/');
+    let canonical_uri = format!(
+        "/{}/{}",
+        aws_uri_encode_path_segment(config.bucket_name.trim_matches('/')),
+        aws_uri_encode_path_segment(object_key)
+    );
+    let request_url = format!(
+        "{}/{}/{}",
+        config.endpoint_url.trim_end_matches('/'),
+        config.bucket_name.trim_matches('/'),
+        object_key
+    );
+    let timestamp = aws_timestamp().map_err(|error| {
+        format!("Failed to create the object storage request timestamp: {error}")
+    })?;
+
+    let mut canonical_headers = vec![
+        ("host".to_string(), host),
+        (
+            "x-amz-content-sha256".to_string(),
+            payload_sha256.to_string(),
+        ),
+        ("x-amz-date".to_string(), timestamp.amz_date.clone()),
+    ];
+
+    for (name, value) in extra_headers {
+        canonical_headers.push((name.to_ascii_lowercase(), value.trim().to_string()));
+    }
+
+    canonical_headers.sort_by(|left, right| left.0.cmp(&right.0));
+
+    let canonical_headers_text = canonical_headers
+        .iter()
+        .map(|(name, value)| format!("{name}:{value}\n"))
+        .collect::<String>();
+    let signed_headers = canonical_headers
+        .iter()
+        .map(|(name, _)| name.as_str())
+        .collect::<Vec<_>>()
+        .join(";");
+    let credential_scope = format!(
+        "{}/{}/s3/aws4_request",
+        timestamp.date_stamp, config.region
+    );
+    let canonical_request = format!(
+        "{method}\n{canonical_uri}\n\n{canonical_headers_text}\n{signed_headers}\n{payload_sha256}"
+    );
+    let string_to_sign = format!(
+        "AWS4-HMAC-SHA256\n{}\n{}\n{}",
+        timestamp.amz_date,
+        credential_scope,
+        sha256_hex(canonical_request.as_bytes())
+    );
+    let signature = aws_v4_signature(
+        &config.secret_access_key,
+        &timestamp.date_stamp,
+        &config.region,
+        "s3",
+        &string_to_sign,
+    )?;
+    let authorization = format!(
+        "AWS4-HMAC-SHA256 Credential={}/{}, SignedHeaders={}, Signature={}",
+        config.access_key_id, credential_scope, signed_headers, signature
     );
 
-    Ok((bucket, credentials))
+    let mut headers = canonical_headers;
+    headers.push(("authorization".to_string(), authorization));
+
+    Ok(SignedObjectStorageRequest {
+        url: request_url,
+        headers,
+    })
+}
+
+fn build_object_storage_http_client() -> Result<BlockingHttpClient, String> {
+    BlockingHttpClient::builder()
+        .http1_only()
+        .connect_timeout(Duration::from_secs(20))
+        .timeout(None::<Duration>)
+        .build()
+        .map_err(|error| format!("Failed to initialize the object storage HTTP client: {error}"))
+}
+
+fn reqwest_headers(headers: &[(String, String)]) -> Result<reqwest::header::HeaderMap, String> {
+    use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
+
+    let mut map = HeaderMap::new();
+    for (name, value) in headers {
+        let header_name = HeaderName::from_bytes(name.as_bytes())
+            .map_err(|error| format!("Invalid object storage header name `{name}`: {error}"))?;
+        let header_value = HeaderValue::from_str(value)
+            .map_err(|error| format!("Invalid object storage header value for `{name}`: {error}"))?;
+        map.insert(header_name, header_value);
+    }
+
+    Ok(map)
+}
+
+fn endpoint_host_header(endpoint: &Url) -> Result<String, String> {
+    let host = endpoint
+        .host_str()
+        .ok_or_else(|| "The object storage endpoint is missing a host.".to_string())?;
+
+    Ok(match endpoint.port() {
+        Some(port) => format!("{host}:{port}"),
+        None => host.to_string(),
+    })
+}
+
+fn aws_uri_encode_path_segment(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+
+    for byte in value.as_bytes() {
+        match byte {
+            b'A'..=b'Z'
+            | b'a'..=b'z'
+            | b'0'..=b'9'
+            | b'-'
+            | b'_'
+            | b'.'
+            | b'~'
+            | b'/' => encoded.push(*byte as char),
+            _ => encoded.push_str(&format!("%{byte:02X}")),
+        }
+    }
+
+    encoded
+}
+
+fn aws_v4_signature(
+    secret_access_key: &str,
+    date_stamp: &str,
+    region: &str,
+    service: &str,
+    string_to_sign: &str,
+) -> Result<String, String> {
+    let key_date = hmac_sha256(format!("AWS4{secret_access_key}").as_bytes(), date_stamp)?;
+    let key_region = hmac_sha256(&key_date, region)?;
+    let key_service = hmac_sha256(&key_region, service)?;
+    let signing_key = hmac_sha256(&key_service, "aws4_request")?;
+    let signature = hmac_sha256(&signing_key, string_to_sign)?;
+    Ok(hex_lower(&signature))
+}
+
+fn hmac_sha256(key: &[u8], message: &str) -> Result<Vec<u8>, String> {
+    let mut mac =
+        Hmac::<Sha256>::new_from_slice(key).map_err(|error| format!("Invalid HMAC key: {error}"))?;
+    mac.update(message.as_bytes());
+    Ok(mac.finalize().into_bytes().to_vec())
+}
+
+fn sha256_hex(data: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(data);
+    hex_lower(&hasher.finalize())
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(bytes.len() * 2);
+
+    for byte in bytes {
+        output.push(HEX[(byte >> 4) as usize] as char);
+        output.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+
+    output
+}
+
+struct AwsTimestamp {
+    amz_date: String,
+    date_stamp: String,
+}
+
+fn aws_timestamp() -> Result<AwsTimestamp, time::error::Format> {
+    let now = OffsetDateTime::now_utc();
+    let amz_date = now.format(format_description!("[year][month][day]T[hour][minute][second]Z"))?;
+    let date_stamp = now.format(format_description!("[year][month][day]"))?;
+
+    Ok(AwsTimestamp {
+        amz_date,
+        date_stamp,
+    })
+}
+
+fn format_reqwest_error(error: &reqwest::Error) -> String {
+    let mut message = error.to_string();
+    let mut source = error.source();
+
+    while let Some(next) = source {
+        message.push_str(" Caused by: ");
+        message.push_str(&next.to_string());
+        source = next.source();
+    }
+
+    message
 }
 
 fn enqueue_run_request(
@@ -1473,6 +1856,34 @@ fn artifact_record_key(job_id: &str) -> String {
     format!("{ARTIFACT_RECORD_PREFIX}{job_id}")
 }
 
+fn redis_worker_key(worker_id: &str) -> String {
+    format!("worker:{worker_id}")
+}
+
+fn redis_worker_alive_key(worker_id: &str) -> String {
+    format!("worker_alive:{worker_id}")
+}
+
+fn contributor_profile_key(worker_id: &str) -> String {
+    format!("{CONTRIBUTOR_PROFILE_PREFIX}{worker_id}")
+}
+
+fn to_contributor_worker_profile(
+    profile_record: &RedisContributorProfileRecord,
+) -> ContributorWorkerProfile {
+    ContributorWorkerProfile {
+        worker_id: profile_record.worker_id.clone(),
+        name: profile_record.name.clone(),
+        email: profile_record.email.clone(),
+        location: profile_record.location.clone(),
+        worker_version: profile_record.worker_version.clone(),
+        available_cpu_cores: profile_record.available_resources.cpu_cores,
+        available_gpu_count: profile_record.available_resources.gpu_count,
+        available_memory_mb: profile_record.available_resources.memory_mb,
+        available_storage_gb: profile_record.available_storage_gb,
+    }
+}
+
 fn sanitize_name(name: &str) -> String {
     let sanitized = name
         .chars()
@@ -1561,7 +1972,9 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             create_project_docker_image,
             request_project_run,
-            list_incoming_run_requests
+            list_incoming_run_requests,
+            setup_contributor_worker,
+            get_registered_contributor_worker
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
