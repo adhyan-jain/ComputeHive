@@ -13,9 +13,11 @@
     "withGlobalTauri": true,
     "windows": [
       {
-        "title": "computehive",
-        "width": 800,
-        "height": 600
+        "title": "ComputeHive Desktop",
+        "width": 1320,
+        "height": 860,
+        "minWidth": 1080,
+        "minHeight": 720
       }
     ],
     "security": {
