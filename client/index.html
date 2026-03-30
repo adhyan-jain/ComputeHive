@@ -4,40 +4,211 @@
     <meta charset="UTF-8" />
     <link rel="stylesheet" href="/src/styles.css" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Tauri App</title>
+    <title>ComputeHive Desktop</title>
     <script type="module" src="/src/main.ts" defer></script>
   </head>
 
   <body>
-    <main class="container">
-      <h1>Welcome to Tauri</h1>
+    <div class="backdrop">
+      <div class="glow glow-one"></div>
+      <div class="glow glow-two"></div>
+      <div class="glow glow-three"></div>
+    </div>
 
-      <div class="row">
-        <a href="https://vite.dev" target="_blank">
-          <img src="/src/assets/vite.svg" class="logo vite" alt="Vite logo" />
-        </a>
-        <a href="https://tauri.app" target="_blank">
-          <img
-            src="/src/assets/tauri.svg"
-            class="logo tauri"
-            alt="Tauri logo"
-          />
-        </a>
-        <a href="https://www.typescriptlang.org/docs" target="_blank">
-          <img
-            src="/src/assets/typescript.svg"
-            class="logo typescript"
-            alt="typescript logo"
-          />
-        </a>
-      </div>
-      <p>Click on the Tauri logo to learn more about the framework</p>
+    <div class="app-shell">
+      <header class="masthead reveal">
+        <div class="brand-column">
+          <p class="eyebrow" id="mode-eyebrow">Project Upload Flow</p>
+          <h1 id="mode-heading">
+            Prepare project folders for compute handoff without leaving the
+            desktop app.
+          </h1>
+          <p class="lead" id="mode-copy">
+            Choose a project directory, compress it into a lean archive that
+            stays beside the source folder, and keep the contributor Docker work
+            reserved under Contributor Actions.
+          </p>
+        </div>
 
-      <form class="row" id="greet-form">
-        <input id="greet-input" placeholder="Enter a name..." />
-        <button type="submit">Greet</button>
-      </form>
-      <p id="greet-msg"></p>
-    </main>
+        <div class="mode-switch" role="tablist" aria-label="Choose interface">
+          <button
+            class="mode-chip is-active"
+            type="button"
+            data-mode="user"
+            aria-selected="true"
+          >
+            Project User
+          </button>
+          <button
+            class="mode-chip"
+            type="button"
+            data-mode="contributor"
+            aria-selected="false"
+          >
+            Contributor
+          </button>
+        </div>
+      </header>
+
+      <main class="workspace">
+        <section class="panel workflow-panel is-active reveal" data-panel="user">
+          <div class="panel-header">
+            <div>
+              <p class="eyebrow">Upload Surface</p>
+              <h2>Folder input and bundle preparation</h2>
+            </div>
+
+            <button id="clear-selection" class="ghost-button" type="button">
+              Clear
+            </button>
+          </div>
+
+          <div class="user-grid">
+            <div class="upload-region">
+              <div class="upload-dropzone" id="folder-dropzone">
+                <p class="upload-kicker">Project Directory</p>
+                <h3>Choose the folder you want to prepare for compute upload</h3>
+                <p class="support-copy">
+                  The archive is written inside the selected folder itself.
+                  ComputeHive skips common generated directories so the upload
+                  bundle stays lighter than the raw project tree.
+                </p>
+
+                <button id="pick-folder" class="primary-button" type="button">
+                  Select project folder
+                </button>
+
+                <p id="selected-path" class="path-pill is-empty">
+                  No folder selected yet
+                </p>
+              </div>
+
+              <div class="action-row">
+                <button
+                  id="prepare-bundle"
+                  class="primary-button"
+                  type="button"
+                  disabled
+                >
+                  Prepare upload bundle
+                </button>
+                <p class="action-copy">
+                  Stored in-place as a compressed archive inside the chosen
+                  directory.
+                </p>
+              </div>
+            </div>
+
+            <div class="status-region">
+              <div class="status-card">
+                <div class="status-head">
+                  <div>
+                    <p class="eyebrow">Bundle Status</p>
+                    <h3 id="bundle-summary-title">Waiting for a folder</h3>
+                  </div>
+                  <span id="bundle-status" class="status-pill status-idle">
+                    Idle
+                  </span>
+                </div>
+
+                <p id="bundle-summary" class="support-copy">
+                  Pick a project directory to prepare a compressed upload bundle.
+                </p>
+
+                <div class="metric-grid">
+                  <div class="metric-block">
+                    <span class="metric-label">Included files</span>
+                    <strong id="included-files">0</strong>
+                  </div>
+                  <div class="metric-block">
+                    <span class="metric-label">Source footprint</span>
+                    <strong id="source-size">0 B</strong>
+                  </div>
+                  <div class="metric-block">
+                    <span class="metric-label">Archive footprint</span>
+                    <strong id="archive-size">0 B</strong>
+                  </div>
+                  <div class="metric-block">
+                    <span class="metric-label">Space saved</span>
+                    <strong id="space-saved">0%</strong>
+                  </div>
+                </div>
+
+                <div class="detail-stack">
+                  <div class="detail-section">
+                    <span class="detail-label">Archive output</span>
+                    <p id="archive-path" class="detail-value muted">
+                      The archive path will appear here after compression.
+                    </p>
+                  </div>
+
+                  <div class="detail-section">
+                    <span class="detail-label">Skipped bulky paths</span>
+                    <ul id="skipped-list" class="detail-list">
+                      <li>Generated folders like `node_modules` and `target` are skipped automatically.</li>
+                    </ul>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <section class="panel workflow-panel reveal" data-panel="contributor" hidden>
+          <div class="panel-header">
+            <div>
+              <p class="eyebrow">Contributor Dashboard</p>
+              <h2>Incoming workers queued for local execution</h2>
+            </div>
+
+            <span class="status-pill status-muted">Contributor Actions</span>
+          </div>
+
+          <div class="contributor-grid">
+            <div class="queue-column">
+              <p class="support-copy contributor-copy">
+                This surface is for contributors who offer their compute
+                resources. Incoming worker packages appear here, and the future
+                Docker build and run lifecycle stays grouped under
+                <strong>Contributor Actions</strong>.
+              </p>
+
+              <div id="worker-queue" class="queue-list"></div>
+            </div>
+
+            <aside class="contributor-aside">
+              <div class="future-block">
+                <p class="eyebrow">Reserved Feature</p>
+                <h3>Contributor Actions</h3>
+                <p class="support-copy">
+                  Dockerization, container creation, and local worker execution
+                  are intentionally deferred in this pass. The UI keeps that
+                  capability visible without implementing it yet.
+                </p>
+
+                <button class="ghost-button" type="button" disabled>
+                  Contributor Actions coming later
+                </button>
+              </div>
+
+              <div class="future-notes">
+                <div class="note-row">
+                  <span class="note-label">Worker intake</span>
+                  <p>Show the code package, size, and current readiness.</p>
+                </div>
+                <div class="note-row">
+                  <span class="note-label">Local execution</span>
+                  <p>Will later create containers only on the contributor machine.</p>
+                </div>
+                <div class="note-row">
+                  <span class="note-label">Current state</span>
+                  <p>Dashboard only. No Docker implementation in this build.</p>
+                </div>
+              </div>
+            </aside>
+          </div>
+        </section>
+      </main>
+    </div>
   </body>
 </html>
