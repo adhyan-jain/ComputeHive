@@ -793,6 +793,110 @@ h3 {
   line-height: 1.55;
 }
 
+.command-editor {
+  display: grid;
+  gap: 0.85rem;
+  margin: 1.2rem 0 1.4rem;
+  padding: 1rem;
+  border-radius: 1.1rem;
+  background: rgba(243, 237, 226, 0.54);
+  border: 1px solid rgba(29, 26, 23, 0.08);
+}
+
+.command-editor-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 1rem;
+}
+
+.icon-button {
+  display: inline-grid;
+  place-items: center;
+  width: 2.4rem;
+  height: 2.4rem;
+  border: 1px solid rgba(29, 26, 23, 0.1);
+  border-radius: 999px;
+  background: rgba(255, 252, 246, 0.9);
+  color: var(--ink);
+  font-size: 1.25rem;
+  line-height: 1;
+  cursor: pointer;
+  transition:
+    transform 180ms ease,
+    border-color 180ms ease,
+    background-color 180ms ease;
+}
+
+.icon-button:hover {
+  transform: translateY(-1px);
+  border-color: rgba(15, 118, 110, 0.35);
+  background: rgba(255, 252, 246, 1);
+}
+
+.command-list {
+  display: grid;
+  gap: 0.7rem;
+  max-height: 11rem;
+  overflow-y: auto;
+  padding-right: 0.2rem;
+}
+
+.command-row {
+  position: relative;
+  display: block;
+}
+
+.command-input {
+  width: 100%;
+  min-height: 2.85rem;
+  border: 1px solid rgba(29, 26, 23, 0.12);
+  border-radius: 0.85rem;
+  background: rgba(255, 252, 246, 0.92);
+  color: var(--ink);
+  padding: 0.76rem 0.88rem;
+}
+
+.command-input:focus {
+  outline: none;
+  border-color: rgba(15, 118, 110, 0.42);
+  box-shadow: 0 0 0 3px rgba(15, 118, 110, 0.08);
+}
+
+.command-remove {
+  position: absolute;
+  top: 0.45rem;
+  right: 0.45rem;
+  display: inline-grid;
+  place-items: center;
+  width: 1.65rem;
+  height: 1.65rem;
+  border: 0;
+  border-radius: 999px;
+  background: rgba(29, 26, 23, 0.08);
+  color: rgba(29, 26, 23, 0.72);
+  font-size: 1rem;
+  line-height: 1;
+  cursor: pointer;
+  opacity: 0;
+  pointer-events: none;
+  transition:
+    opacity 160ms ease,
+    background-color 160ms ease,
+    color 160ms ease;
+}
+
+.command-row:hover .command-remove,
+.command-row:focus-within .command-remove {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.command-remove:hover {
+  background: rgba(139, 69, 19, 0.12);
+  color: #8b4513;
+}
+
 .contributor-input {
   width: 100%;
   border: 1px solid rgba(29, 26, 23, 0.14);

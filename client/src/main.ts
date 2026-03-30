@@ -139,6 +139,10 @@ const imageSize = getElement<HTMLElement>("#image-size");
 const dockerSetupSource =
   getElement<HTMLElement>("#docker-setup-source");
 const buildNotes = getElement<HTMLUListElement>("#build-notes");
+const addCommandButton =
+  getElement<HTMLButtonElement>("#add-command");
+const commandList =
+  getElement<HTMLElement>("#command-list");
 const contributorWorkerNameInput =
   getElement<HTMLInputElement>("#contributor-worker-name");
 const contributorWorkerPasswordInput =
@@ -175,6 +179,7 @@ const state: {
   buildResult: DockerImageResult | null;
   runResult: RunRequestResult | null;
   error: string;
+  cmdlist: string[];
   contributorWorker: ContributorWorkerRecord | null;
   contributorWorkerLoaded: boolean;
   contributorSetupLoading: boolean;
@@ -189,6 +194,7 @@ const state: {
   buildResult: null,
   runResult: null,
   error: "",
+  cmdlist: [""],
   contributorWorker: null,
   contributorWorkerLoaded: false,
   contributorSetupLoading: false,
@@ -257,6 +263,42 @@ function renderLink(
   element.removeAttribute("href");
   element.textContent = placeholder;
   element.classList.add("is-placeholder", "muted");
+}
+
+function renderCommandList(): void {
+  commandList.replaceChildren();
+
+  state.cmdlist.forEach((command, index) => {
+    const row = document.createElement("div");
+    row.className = "command-row";
+
+    const removeButton = document.createElement("button");
+    removeButton.className = "command-remove";
+    removeButton.type = "button";
+    removeButton.setAttribute("aria-label", `Delete command ${index + 1}`);
+    removeButton.textContent = "×";
+    removeButton.addEventListener("click", () => {
+      state.cmdlist.splice(index, 1);
+      if (state.cmdlist.length === 0) {
+        state.cmdlist.push("");
+      }
+      renderCommandList();
+    });
+
+    const input = document.createElement("input");
+    input.className = "command-input";
+    input.type = "text";
+    input.placeholder = `Command ${index + 1}`;
+    input.value = command;
+    input.setAttribute("aria-label", `Command ${index + 1}`);
+    input.addEventListener("input", (event) => {
+      const target = event.currentTarget as HTMLInputElement;
+      state.cmdlist[index] = target.value;
+    });
+
+    row.append(removeButton, input);
+    commandList.append(row);
+  });
 }
 
 function statusLabel(status: BuildStatus): string {
@@ -956,3 +998,9 @@ clearSelectionButton.addEventListener("click", clearSelection);
 renderMode();
 renderUserState();
 renderContributorSetup();
+renderCommandList();
+
+addCommandButton.addEventListener("click", () => {
+  state.cmdlist.push("");
+  renderCommandList();
+});
