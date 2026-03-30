@@ -145,6 +145,28 @@
                   build the image, and queue the uploaded tar.gz artifact.
                 </p>
 
+                <div class="command-editor">
+                  <div class="command-editor-head">
+                    <div>
+                      <span class="detail-label">Command list</span>
+                      <p class="support-copy bundle-summary-text">
+                        Add one command per row. The UI stores these values in
+                        <code>cmdlist</code>.
+                      </p>
+                    </div>
+                    <button
+                      id="add-command"
+                      class="icon-button"
+                      type="button"
+                      aria-label="Add command"
+                    >
+                      +
+                    </button>
+                  </div>
+
+                  <div id="command-list" class="command-list" aria-live="polite"></div>
+                </div>
+
                 <div class="metric-grid">
                   <div class="metric-block">
                     <span class="metric-label">Detected stack</span>
