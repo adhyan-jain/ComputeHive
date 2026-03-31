@@ -20,7 +20,7 @@
         <div class="brand-column">
           <p class="eyebrow" id="mode-eyebrow">Project Image Flow</p>
           <div class="title-orbit">
-            <h1 id="mode-heading">Compile Hive</h1>
+            <h1 id="mode-heading">Compute Hive</h1>
           </div>
           <p class="lead" id="mode-copy">
             Choose a project directory. ComputeHive prepares Docker when needed,
@@ -150,8 +150,8 @@
                     <div>
                       <span class="detail-label">Command list</span>
                       <p class="support-copy bundle-summary-text">
-                        Add one command per row. The UI stores these values in
-                        <code>cmdlist</code>.
+                        Add one shell command line per row. The worker executes
+                        the list via <code>/bin/sh -lc</code> inside the container.
                       </p>
                     </div>
                     <button
@@ -213,6 +213,20 @@
                     <p id="run-request-details" class="detail-value muted">
                       The Redis job id and object storage key will appear here after you request a run.
                     </p>
+                  </div>
+
+                  <div class="detail-section">
+                    <span class="detail-label">Job result</span>
+                    <p id="run-result-status" class="detail-value muted">
+                      Worker output will appear here after the job is completed.
+                    </p>
+                  </div>
+
+                  <div class="detail-section">
+                    <span class="detail-label">Worker stdout excerpt</span>
+                    <pre id="run-result-output" class="detail-output muted">
+Waiting for job execution output.
+                    </pre>
                   </div>
 
                   <div class="detail-section">
