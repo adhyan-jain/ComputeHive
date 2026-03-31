@@ -221,6 +221,36 @@ struct RedisJobRecord {
     assigned_worker_id: String,
 }
 
+#[derive(Serialize, Deserialize, Default)]
+#[serde(default)]
+struct RedisResultRecord {
+    job_id: String,
+    worker_id: String,
+    result_status: String,
+    partial: bool,
+    exit_code: i32,
+    stdout_excerpt: String,
+    stderr_excerpt: String,
+    output_uri: String,
+    finished_at_unix: i64,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RunRequestJobResult {
+    job_id: String,
+    worker_id: String,
+    status: String,
+    result_status: String,
+    partial: bool,
+    exit_code: i32,
+    stdout_excerpt: String,
+    stderr_excerpt: String,
+    output_uri: String,
+    finished_at_unix: i64,
+    completed: bool,
+}
+
 #[derive(Serialize)]
 struct ContributorWorkerRecord {
     id: String,
@@ -317,8 +347,14 @@ fn create_project_docker_image(project_path: String) -> Result<DockerImageResult
 }
 
 #[tauri::command]
-async fn request_project_run(project_path: String) -> Result<RunRequestResult, String> {
+async fn request_project_run(project_path: String, command: Vec<String>) -> Result<RunRequestResult, String> {
     let config = app_config()?;
+    let command_line_count = command
+        .iter()
+        .map(|segment| segment.trim())
+        .filter(|segment| !segment.is_empty())
+        .count();
+    let normalized_command = normalize_client_command(command)?;
     let image = build_project_docker_image(&project_path)?;
     let project_root = PathBuf::from(&image.project_root);
     let gzip_archive_path = tar_gz_path_for_project(&project_root, &image.project_name);
@@ -365,47 +401,14 @@ async fn request_project_run(project_path: String) -> Result<RunRequestResult, S
         created_at_unix: current_unix_timestamp(),
     };
 
-    let mut environment = HashMap::new();
-    environment.insert(
-        "COMPUTEHIVE_ARTIFACT_SHA256".to_string(),
-        artifact_record.artifact_sha256.clone(),
-    );
-    environment.insert(
-        "COMPUTEHIVE_ARTIFACT_URI".to_string(),
-        artifact_record.artifact_uri.clone(),
-    );
-    environment.insert(
-        "COMPUTEHIVE_ARTIFACT_API_URL".to_string(),
-        artifact_record.artifact_api_url.clone(),
-    );
-    environment.insert(
-        "COMPUTEHIVE_ARTIFACT_OBJECT_KEY".to_string(),
-        artifact_record.artifact_object_key.clone(),
-    );
-    environment.insert(
-        "COMPUTEHIVE_PROJECT_NAME".to_string(),
-        artifact_record.project_name.clone(),
-    );
-    environment.insert(
-        "COMPUTEHIVE_DETECTED_STACK".to_string(),
-        artifact_record.detected_stack.clone(),
-    );
-    environment.insert("COMPUTEHIVE_IMAGE_TAG".to_string(), image.image_tag.clone());
-    environment.insert(
-        "COMPUTEHIVE_IMAGE_ARCHIVE_PATH".to_string(),
-        artifact_record.gzip_archive_path.clone(),
-    );
-
-    let coordinator_job_id = match submit_job_to_coordinator(config, &image, environment).await {
-        Ok(job_id) => job_id,
-        Err(error) => {
-            let cleanup_result = delete_artifact_from_object_storage(config, &object_key).await;
-            let cleanup_message = match cleanup_result {
-                Ok(()) => "The uploaded artifact was cleaned up automatically.".to_string(),
-                Err(cleanup_error) => format!(
-                    "The uploaded artifact could not be cleaned up automatically: {cleanup_error}"
-                ),
-            };
+    if let Err(error) = enqueue_run_request(config, &job_id, &image, &artifact_record, &normalized_command) {
+        let cleanup_result = delete_artifact_from_object_storage(config, &object_key).await;
+        let cleanup_message = match cleanup_result {
+            Ok(()) => "The uploaded artifact was cleaned up automatically.".to_string(),
+            Err(cleanup_error) => format!(
+                "The uploaded artifact could not be cleaned up automatically: {cleanup_error}"
+            ),
+        };
 
             return Err(format!(
                 "Failed to submit the run request to the coordinator after uploading the artifact. {error} {cleanup_message}"
@@ -437,11 +440,20 @@ async fn request_project_run(project_path: String) -> Result<RunRequestResult, S
         );
     }
     notes.push(format!(
-        "Submitted the run request to the coordinator SubmitJob endpoint as job {}.",
-        coordinator_job_id
+        "Queued a coordinator-compatible Redis job under {} and pushed it onto {}.",
+        job_key(&job_id),
+        JOB_QUEUE_KEY
+    ));
+    notes.push(format!(
+        "Stored {} client command line(s) in the queued job record.",
+        command_line_count
     ));
     notes.push(
-        "The submitted job carries the artifact hash and object storage location in its environment for future contributor actions."
+        "Worker executes the command list via /bin/sh -lc so full command lines (for example: python3 train_model.py) work as expected."
+            .to_string(),
+    );
+    notes.push(
+        "The queued job carries the artifact hash and object storage location in its environment for future contributor actions."
             .to_string(),
     );
     notes.push(
@@ -599,6 +611,74 @@ fn list_incoming_run_requests() -> Result<Vec<IncomingRunRequest>, String> {
     }
 
     Ok(requests)
+}
+
+#[tauri::command]
+fn get_run_request_result(job_id: String) -> Result<Option<RunRequestJobResult>, String> {
+    let trimmed_job_id = job_id.trim();
+    if trimmed_job_id.is_empty() {
+        return Err("job_id is required".to_string());
+    }
+
+    let config = app_config()?;
+    let client = redis::Client::open(config.redis_url.as_str())
+        .map_err(|error| format!("Failed to parse the Redis URL: {error}"))?;
+    let mut connection = client
+        .get_connection()
+        .map_err(|error| format!("Failed to connect to Redis: {error}"))?;
+
+    let status = connection
+        .get::<_, Option<String>>(job_status_key(trimmed_job_id))
+        .map_err(|error| {
+            format!(
+                "Failed to read job status {}: {error}",
+                job_status_key(trimmed_job_id)
+            )
+        })?
+        .unwrap_or_default();
+
+    let result_payload = connection
+        .get::<_, Option<String>>(result_key(trimmed_job_id))
+        .map_err(|error| format!("Failed to read job result {}: {error}", result_key(trimmed_job_id)))?;
+
+    if status.trim().is_empty() && result_payload.is_none() {
+        return Ok(None);
+    }
+
+    let result_record = result_payload
+        .as_deref()
+        .map(serde_json::from_str::<RedisResultRecord>)
+        .transpose()
+        .map_err(|error| {
+            format!(
+                "Failed to parse result record {}: {error}",
+                result_key(trimmed_job_id)
+            )
+        })?
+        .unwrap_or_default();
+
+    let is_terminal_status = matches!(status.as_str(), "completed" | "failed");
+    let is_terminal_result =
+        matches!(result_record.result_status.as_str(), "STATUS_SUCCEEDED" | "STATUS_FAILED")
+            && !result_record.partial;
+
+    Ok(Some(RunRequestJobResult {
+        job_id: if result_record.job_id.trim().is_empty() {
+            trimmed_job_id.to_string()
+        } else {
+            result_record.job_id
+        },
+        worker_id: result_record.worker_id,
+        status,
+        result_status: result_record.result_status,
+        partial: result_record.partial,
+        exit_code: result_record.exit_code,
+        stdout_excerpt: result_record.stdout_excerpt,
+        stderr_excerpt: result_record.stderr_excerpt,
+        output_uri: result_record.output_uri,
+        finished_at_unix: result_record.finished_at_unix,
+        completed: is_terminal_status || is_terminal_result,
+    }))
 }
 
 #[tauri::command]
@@ -1842,13 +1922,104 @@ fn format_reqwest_error(error: &reqwest::Error) -> String {
     message
 }
 
-fn placeholder_contributor_command() -> Vec<String> {
-    vec![
-        "/bin/sh".to_string(),
-        "-lc".to_string(),
-        "echo 'ComputeHive artifact verified and queued. Contributor actions will load and run this image in a later pass.'"
-            .to_string(),
-    ]
+fn enqueue_run_request(
+    config: &AppConfig,
+    job_id: &str,
+    image: &DockerImageResult,
+    artifact_record: &ArtifactRecord,
+    command: &[String],
+) -> Result<(), String> {
+    let client = redis::Client::open(config.redis_url.as_str())
+        .map_err(|error| format!("Failed to parse the Redis URL: {error}"))?;
+    let mut connection = client
+        .get_connection()
+        .map_err(|error| format!("Failed to connect to Redis: {error}"))?;
+
+    let mut environment = HashMap::new();
+    environment.insert(
+        "COMPUTEHIVE_ARTIFACT_SHA256".to_string(),
+        artifact_record.artifact_sha256.clone(),
+    );
+    environment.insert(
+        "COMPUTEHIVE_ARTIFACT_URI".to_string(),
+        artifact_record.artifact_uri.clone(),
+    );
+    environment.insert(
+        "COMPUTEHIVE_ARTIFACT_API_URL".to_string(),
+        artifact_record.artifact_api_url.clone(),
+    );
+    environment.insert(
+        "COMPUTEHIVE_ARTIFACT_OBJECT_KEY".to_string(),
+        artifact_record.artifact_object_key.clone(),
+    );
+    environment.insert(
+        "COMPUTEHIVE_PROJECT_NAME".to_string(),
+        artifact_record.project_name.clone(),
+    );
+    environment.insert(
+        "COMPUTEHIVE_DETECTED_STACK".to_string(),
+        artifact_record.detected_stack.clone(),
+    );
+    environment.insert("COMPUTEHIVE_IMAGE_TAG".to_string(), image.image_tag.clone());
+    environment.insert(
+        "COMPUTEHIVE_IMAGE_ARCHIVE_PATH".to_string(),
+        artifact_record.gzip_archive_path.clone(),
+    );
+
+    let job_record = RedisJobRecord {
+        id: job_id.to_string(),
+        container_image: image.image_tag.clone(),
+        command: command.to_vec(),
+        required_resources: Some(default_required_resources()),
+        environment,
+        max_runtime_seconds: DEFAULT_MAX_RUNTIME_SECONDS,
+        status: JOB_STATUS_QUEUED.to_string(),
+        created_at_unix: artifact_record.created_at_unix,
+        assigned_worker_id: String::new(),
+    };
+
+    let job_payload = serde_json::to_string(&job_record)
+        .map_err(|error| format!("Failed to encode the Redis job record: {error}"))?;
+    let artifact_payload = serde_json::to_string(artifact_record)
+        .map_err(|error| format!("Failed to encode the artifact metadata record: {error}"))?;
+
+    redis::pipe()
+        .atomic()
+        .set(job_key(job_id), job_payload)
+        .ignore()
+        .set(job_status_key(job_id), JOB_STATUS_QUEUED)
+        .ignore()
+        .rpush(JOB_QUEUE_KEY, job_id)
+        .ignore()
+        .set(artifact_record_key(job_id), artifact_payload)
+        .ignore()
+        .query::<()>(&mut connection)
+        .map_err(|error| format!("Failed to enqueue the run request in Redis: {error}"))?;
+
+    Ok(())
+}
+
+fn default_required_resources() -> RedisResourceSpec {
+    RedisResourceSpec {
+        cpu_cores: DEFAULT_REQUIRED_CPU_CORES,
+        gpu_count: DEFAULT_REQUIRED_GPU_COUNT,
+        memory_mb: DEFAULT_REQUIRED_MEMORY_MB,
+    }
+}
+
+fn normalize_client_command(command: Vec<String>) -> Result<Vec<String>, String> {
+    let lines = command
+        .into_iter()
+        .map(|segment| segment.trim().to_string())
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>();
+
+    if lines.is_empty() {
+        return Err("At least one command segment is required before requesting a run.".to_string());
+    }
+
+    let script = lines.join("\n");
+    Ok(vec!["/bin/sh".to_string(), "-lc".to_string(), script])
 }
 
 fn tar_gz_path_for_project(project_root: &Path, project_name: &str) -> PathBuf {
@@ -2021,6 +2192,10 @@ fn job_key(job_id: &str) -> String {
 
 fn job_status_key(job_id: &str) -> String {
     format!("job_status:{job_id}")
+}
+
+fn result_key(job_id: &str) -> String {
+    format!("result:{job_id}")
 }
 
 fn artifact_record_key(job_id: &str) -> String {
@@ -2222,6 +2397,7 @@ pub fn run() {
             create_project_docker_image,
             request_project_run,
             list_incoming_run_requests,
+            get_run_request_result,
             register_contributor_worker,
             login_contributor_worker,
             activate_contributor_worker,

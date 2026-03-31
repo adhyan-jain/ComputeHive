@@ -39,6 +39,20 @@ interface RunRequestResult {
   notes: string[];
 }
 
+interface RunRequestJobResult {
+  jobId: string;
+  workerId: string;
+  status: string;
+  resultStatus: string;
+  partial: boolean;
+  exitCode: number;
+  stdoutExcerpt: string;
+  stderrExcerpt: string;
+  outputUri: string;
+  finishedAtUnix: number;
+  completed: boolean;
+}
+
 interface ContributorWorkerRecord {
   id: string;
   status: string;
@@ -94,6 +108,7 @@ const modeBurstTimers = new WeakMap<HTMLButtonElement, number>();
 const processLogTimers = new Set<number>();
 let nextProcessLogId = 1;
 let renderedProcessLogCount = 0;
+let jobResultPollTimer: number | null = null;
 
 function getElement<T extends Element>(selector: string): T {
   const element = document.querySelector<T>(selector);
@@ -131,6 +146,10 @@ const gzipOutputPath = getElement<HTMLElement>("#gzip-output-path");
 const artifactHash = getElement<HTMLElement>("#artifact-hash");
 const runRequestDetails =
   getElement<HTMLElement>("#run-request-details");
+const runResultStatus =
+  getElement<HTMLElement>("#run-result-status");
+const runResultOutput =
+  getElement<HTMLElement>("#run-result-output");
 const artifactPublicLink =
   getElement<HTMLAnchorElement>("#artifact-public-link");
 const detectedStack = getElement<HTMLElement>("#detected-stack");
@@ -178,6 +197,8 @@ const state: {
   buildStatus: BuildStatus;
   buildResult: DockerImageResult | null;
   runResult: RunRequestResult | null;
+  jobResult: RunRequestJobResult | null;
+  resultTerminalLogged: boolean;
   error: string;
   cmdlist: string[];
   contributorWorker: ContributorWorkerRecord | null;
@@ -193,6 +214,8 @@ const state: {
   buildStatus: "idle",
   buildResult: null,
   runResult: null,
+  jobResult: null,
+  resultTerminalLogged: false,
   error: "",
   cmdlist: [""],
   contributorWorker: null,
@@ -571,6 +594,72 @@ function appendResultLogs(result: RunRequestResult): void {
   });
 }
 
+function stopJobResultPolling(): void {
+  if (jobResultPollTimer !== null) {
+    window.clearInterval(jobResultPollTimer);
+    jobResultPollTimer = null;
+  }
+}
+
+async function refreshRunRequestResult(jobId: string): Promise<void> {
+  try {
+    const result = await invoke<RunRequestJobResult | null>(
+      "get_run_request_result",
+      { jobId },
+    );
+
+    if (!result) {
+      return;
+    }
+
+    state.jobResult = result;
+
+    if (result.completed && !state.resultTerminalLogged) {
+      state.resultTerminalLogged = true;
+
+      if (result.resultStatus === "STATUS_SUCCEEDED") {
+        state.logStage = "Completed";
+        addProcessLog("success", `Job ${result.jobId} finished successfully.`);
+      } else if (result.resultStatus === "STATUS_FAILED") {
+        state.logStage = "Failed";
+        addProcessLog(
+          "error",
+          `Job ${result.jobId} failed with exit code ${result.exitCode}.`,
+        );
+      } else {
+        addProcessLog(
+          "info",
+          `Job ${result.jobId} status changed to ${result.status || "unknown"}.`,
+        );
+      }
+
+      const excerpt = result.stdoutExcerpt.trim() || result.stderrExcerpt.trim();
+      if (excerpt) {
+        addProcessLog(
+          result.resultStatus === "STATUS_FAILED" ? "error" : "success",
+          `Worker output: ${excerpt}`,
+        );
+      }
+    }
+
+    if (result.completed) {
+      stopJobResultPolling();
+    }
+
+    renderUserState();
+  } catch {
+    // Keep polling; transient errors should not break the flow.
+  }
+}
+
+function startJobResultPolling(jobId: string): void {
+  stopJobResultPolling();
+  void refreshRunRequestResult(jobId);
+  jobResultPollTimer = window.setInterval(() => {
+    void refreshRunRequestResult(jobId);
+  }, 3000);
+}
+
 function renderContributorSetup(): void {
   contributorRegisterSubmit.disabled = state.contributorSetupLoading;
   contributorLoginSubmit.disabled = state.contributorSetupLoading;
@@ -694,6 +783,27 @@ function renderUserState(): void {
     artifactHash.textContent = state.runResult.artifactSha256;
     runRequestDetails.textContent =
       `${state.runResult.redisJobId} · ${state.runResult.artifactObjectKey}`;
+
+    if (state.jobResult) {
+      const finishedText = state.jobResult.finishedAtUnix
+        ? ` · finished ${formatUnixTime(state.jobResult.finishedAtUnix)}`
+        : "";
+      runResultStatus.textContent =
+        `${state.jobResult.resultStatus || state.jobResult.status || "queued"} · exit ${state.jobResult.exitCode}${finishedText}`;
+
+      const outputText =
+        state.jobResult.stdoutExcerpt || state.jobResult.stderrExcerpt;
+      runResultOutput.textContent =
+        outputText || "No stdout/stderr excerpt is available yet.";
+      runResultOutput.classList.toggle("muted", outputText.length === 0);
+    } else {
+      runResultStatus.textContent =
+        "Queued. Waiting for worker to start and submit output.";
+      runResultOutput.textContent =
+        "Waiting for job execution output.";
+      runResultOutput.classList.add("muted");
+    }
+
     renderLink(
       artifactPublicLink,
       state.runResult.artifactPublicUrl,
@@ -709,6 +819,11 @@ function renderUserState(): void {
     "The SHA-256 hash will appear here after upload.";
   runRequestDetails.textContent =
     "The Redis job id and object storage key will appear here after you request a run.";
+  runResultStatus.textContent =
+    "Worker output will appear here after the job is completed.";
+  runResultOutput.textContent =
+    "Waiting for job execution output.";
+  runResultOutput.classList.add("muted");
   renderLink(
     artifactPublicLink,
     "",
@@ -790,22 +905,39 @@ async function requestProjectRun(): Promise<void> {
     return;
   }
 
+  const command = state.cmdlist
+    .map((entry) => entry.trim())
+    .filter((entry) => entry.length > 0);
+  if (command.length === 0) {
+    state.error = "Add at least one command line before requesting a run.";
+    state.buildStatus = "error";
+    state.logStage = "Validation";
+    addProcessLog("error", state.error);
+    renderUserState();
+    return;
+  }
+
   state.buildStatus = "working";
   state.buildResult = null;
   state.runResult = null;
+  state.jobResult = null;
+  state.resultTerminalLogged = false;
   state.error = "";
+  stopJobResultPolling();
   stageRequestLog();
   renderUserState();
 
   try {
     const result = await invoke<RunRequestResult>("request_project_run", {
       projectPath: state.selectedPath,
+      command,
     });
 
     state.buildResult = result.image;
     state.runResult = result;
     state.buildStatus = "done";
     appendResultLogs(result);
+    startJobResultPolling(result.redisJobId);
   } catch (error) {
     clearProcessLogTimers();
     state.error = error instanceof Error ? error.message : String(error);
@@ -944,11 +1076,14 @@ function loadContributorView(): void {
 }
 
 function clearSelection(): void {
+  stopJobResultPolling();
   clearProcessLogTimers();
   state.selectedPath = "";
   state.buildStatus = "idle";
   state.buildResult = null;
   state.runResult = null;
+  state.jobResult = null;
+  state.resultTerminalLogged = false;
   state.error = "";
   state.logStage = "Idle";
   state.logEntries = [];

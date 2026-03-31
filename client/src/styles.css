@@ -666,6 +666,21 @@ h3 {
   word-break: break-word;
 }
 
+.detail-output {
+  margin: 0.45rem 0 0;
+  padding: 0.7rem 0.85rem;
+  border-radius: 0.75rem;
+  border: 1px solid rgba(29, 26, 23, 0.12);
+  background: rgba(255, 252, 246, 0.9);
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 180px;
+  overflow: auto;
+  line-height: 1.45;
+  font-family: "SF Mono", "Menlo", "Monaco", monospace;
+  font-size: 0.82rem;
+}
+
 .detail-link,
 .queue-link a {
   color: var(--accent);
