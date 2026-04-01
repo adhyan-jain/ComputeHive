@@ -260,89 +260,51 @@ Waiting for job execution output.
           <div class="panel-header">
             <div>
               <p class="eyebrow">Contributor Dashboard</p>
-              <h2>Register and log in this device as a contributor worker</h2>
+              <h2>Local worker sharing</h2>
             </div>
           </div>
 
           <div class="contributor-grid">
             <aside class="contributor-aside">
-              <div id="contributor-auth-card" class="future-block">
-                <p class="eyebrow">Contributor Actions</p>
-                <h3>Register this machine as a worker</h3>
-                <p class="support-copy">
-                  Create a worker with a worker name and password. The app
-                  stores a device-bound worker hash locally and only allows
-                  login on the same device.
-                </p>
-
-                <div class="contributor-form">
-                  <label class="contributor-label" for="contributor-worker-name">Worker name</label>
-                  <input
-                    id="contributor-worker-name"
-                    class="contributor-input"
-                    type="text"
-                    placeholder="worker-alpha"
-                    autocomplete="username"
-                  />
-
-                  <label class="contributor-label" for="contributor-worker-password">Password</label>
-                  <input
-                    id="contributor-worker-password"
-                    class="contributor-input"
-                    type="password"
-                    placeholder="Enter a worker password"
-                    autocomplete="current-password"
-                  />
-
-                  <div class="button-group">
-                    <button id="contributor-register-submit" class="primary-button" type="button">
-                      Register worker
-                    </button>
-                    <button id="contributor-login-submit" class="ghost-button" type="button">
-                      Login worker
-                    </button>
-                  </div>
-                </div>
-
-                <p id="contributor-setup-status" class="support-copy contributor-setup-status">
-                  Register or log in to unlock the contributor worker on this device.
-                </p>
-              </div>
-
-              <div id="contributor-profile-card" class="future-notes contributor-profile" hidden>
+              <div class="future-notes contributor-profile">
                 <div class="panel-header contributor-dashboard-head">
                   <div>
-                    <p class="eyebrow">Worker Dashboard</p>
-                    <h3>Contributor ready</h3>
+                    <p class="eyebrow">Worker Runtime</p>
+                    <h3>Share this machine</h3>
                   </div>
 
                   <button id="contribute-button" class="primary-button" type="button">
-                    Contribute
+                    Start sharing
                   </button>
                 </div>
+
+                <p id="contributor-setup-status" class="support-copy contributor-setup-status">
+                  Start sharing to run the local worker process.
+                </p>
+
                 <div class="note-row">
                   <span class="note-label">Status</span>
-                  <p id="profile-worker-status">Pending</p>
+                  <p id="profile-worker-status">Stopped</p>
                 </div>
                 <div class="note-row">
-                  <span class="note-label">Resources</span>
-                  <p id="profile-worker-resources">CPU: - · Memory: - · GPU: -</p>
+                  <span class="note-label">Process</span>
+                  <p id="profile-worker-resources">Worker PID: not running</p>
                 </div>
                 <div class="note-row">
-                  <span class="note-label">Current load</span>
-                  <p id="profile-worker-load">CPU used: - · Memory used: -</p>
+                  <span class="note-label">Job state</span>
+                  <p id="profile-worker-load">Job state: idle</p>
                 </div>
                 <div class="note-row">
-                  <span class="note-label">Capabilities</span>
-                  <p id="profile-worker-capabilities">Docker: - · GPU supported: -</p>
+                  <span class="note-label">Current job</span>
+                  <p id="profile-worker-capabilities">Current job: none</p>
                 </div>
                 <div class="note-row">
-                  <span class="note-label">Last heartbeat</span>
-                  <p id="profile-worker-heartbeat">Pending</p>
+                  <span class="note-label">Last job</span>
+                  <p id="profile-worker-heartbeat">Last job: none</p>
                 </div>
                 <div class="note-row">
-                  <span class="note-label">Stats</span>
-                  <p id="profile-worker-stats">Completed: - · Failed: -</p>
+                  <span class="note-label">Details</span>
+                  <p id="profile-worker-stats">No sharing activity yet.</p>
                 </div>
               </div>
             </aside>

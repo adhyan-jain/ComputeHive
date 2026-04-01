@@ -10,13 +10,15 @@ use std::{
     collections::HashMap,
     error::Error as StdError,
     fs::{self, File},
-    io::{self, BufReader, BufWriter, ErrorKind, Read},
+    io::{self, BufRead, BufReader, BufWriter, ErrorKind, Read},
     path::{Path, PathBuf},
-    process::{Command, Output},
-    sync::OnceLock,
+    process::{Child, Command, Output, Stdio},
+    sync::{Mutex, OnceLock},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 use time::{macros::format_description, OffsetDateTime};
 use url::Url;
 use uuid::Uuid;
@@ -29,26 +31,21 @@ use coordinatorpb::client_service_client::ClientServiceClient;
 use coordinatorpb::{ResourceSpec as CoordinatorResourceSpec, SubmitJobRequest};
 
 const JOB_QUEUE_KEY: &str = "job_queue";
-const WORKERS_KEY: &str = "workers";
 const JOB_STATUS_QUEUED: &str = "queued";
 const ARTIFACT_RECORD_PREFIX: &str = "computehive_job_artifact:";
-const CONTRIBUTOR_ACTIVE_WORKER_KEY: &str = "computehive_active_contributor_worker";
-const WORKER_AUTH_PREFIX: &str = "computehive_worker_auth:";
-const LOCAL_WORKER_IDENTITY_FILE: &str = ".computehive-worker-identity.json";
 const DEFAULT_MAX_RUNTIME_SECONDS: i32 = 3600;
 const DEFAULT_REQUIRED_CPU_CORES: i32 = 1;
 const DEFAULT_REQUIRED_GPU_COUNT: i32 = 0;
 const DEFAULT_REQUIRED_MEMORY_MB: i32 = 1024;
 const DEFAULT_R2_REGION: &str = "auto";
 const DEFAULT_COORDINATOR_ADDR: &str = "127.0.0.1:50051";
-const DEFAULT_CONTRIBUTOR_CPU_CORES: i32 = 8;
-const DEFAULT_CONTRIBUTOR_GPU_COUNT: i32 = 1;
-const DEFAULT_CONTRIBUTOR_MEMORY_MB: i32 = 16384;
 const EMPTY_PAYLOAD_SHA256: &str =
     "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
 static APP_CONFIG: OnceLock<Result<AppConfig, String>> = OnceLock::new();
 static ENV_FILE_LOADED: OnceLock<()> = OnceLock::new();
+static CONTRIBUTOR_WORKER_CHILD: OnceLock<Mutex<Option<Child>>> = OnceLock::new();
+static CONTRIBUTOR_RUNTIME_STATE: OnceLock<Mutex<ContributorRuntimeState>> = OnceLock::new();
 
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -173,42 +170,6 @@ struct RedisResourceSpec {
 }
 
 #[derive(Serialize, Deserialize)]
-struct RedisWorkerRecord {
-    id: String,
-    status: String,
-    resources: RedisWorkerResources,
-    current_load: RedisWorkerCurrentLoad,
-    capabilities: RedisWorkerCapabilities,
-    last_heartbeat: i64,
-    stats: RedisWorkerStats,
-}
-
-#[derive(Serialize, Deserialize)]
-struct RedisWorkerResources {
-    cpu_cores: i32,
-    memory_mb: i32,
-    gpu: bool,
-}
-
-#[derive(Serialize, Deserialize)]
-struct RedisWorkerCurrentLoad {
-    cpu_used: i32,
-    memory_used: i32,
-}
-
-#[derive(Serialize, Deserialize)]
-struct RedisWorkerCapabilities {
-    docker: bool,
-    gpu_supported: bool,
-}
-
-#[derive(Serialize, Deserialize)]
-struct RedisWorkerStats {
-    jobs_completed: i32,
-    jobs_failed: i32,
-}
-
-#[derive(Serialize, Deserialize)]
 struct RedisJobRecord {
     id: String,
     container_image: String,
@@ -252,53 +213,21 @@ struct RunRequestJobResult {
 }
 
 #[derive(Serialize)]
-struct ContributorWorkerRecord {
-    id: String,
-    status: String,
-    resources: ContributorWorkerResources,
-    current_load: ContributorWorkerCurrentLoad,
-    capabilities: ContributorWorkerCapabilities,
-    last_heartbeat: i64,
-    stats: ContributorWorkerStats,
+#[serde(rename_all = "camelCase")]
+struct ContributorSharingStatus {
+    running: bool,
+    pid: Option<u32>,
+    details: String,
+    job_running: bool,
+    current_job_id: Option<String>,
+    last_job_id: Option<String>,
 }
 
-#[derive(Serialize)]
-struct ContributorWorkerResources {
-    cpu_cores: i32,
-    memory_mb: i32,
-    gpu: bool,
-}
-
-#[derive(Serialize)]
-struct ContributorWorkerCurrentLoad {
-    cpu_used: i32,
-    memory_used: i32,
-}
-
-#[derive(Serialize)]
-struct ContributorWorkerCapabilities {
-    docker: bool,
-    gpu_supported: bool,
-}
-
-#[derive(Serialize)]
-struct ContributorWorkerStats {
-    jobs_completed: i32,
-    jobs_failed: i32,
-}
-
-#[derive(Serialize, Deserialize)]
-struct RedisWorkerAuthRecord {
-    worker_id: String,
-    worker_name: String,
-    password_hash: String,
-}
-
-#[derive(Serialize, Deserialize)]
-struct LocalWorkerIdentity {
-    worker_id: String,
-    worker_name: String,
-    worker_hash: String,
+#[derive(Default)]
+struct ContributorRuntimeState {
+    job_running: bool,
+    current_job_id: Option<String>,
+    last_job_id: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -730,214 +659,335 @@ fn get_run_request_result(job_id: String) -> Result<Option<RunRequestJobResult>,
 }
 
 #[tauri::command]
-fn register_contributor_worker(
-    worker_name: String,
-    password: String,
-) -> Result<ContributorWorkerRecord, String> {
-    let worker_name = normalize_worker_name(&worker_name)?;
-    let password_hash = hash_string(password.trim());
-    let config = app_config()?;
-    let client = redis::Client::open(config.redis_url.as_str())
-        .map_err(|error| format!("Failed to parse the Redis URL: {error}"))?;
-    let mut connection = client
-        .get_connection()
-        .map_err(|error| format!("Failed to connect to Redis: {error}"))?;
+fn start_contributor_sharing() -> Result<ContributorSharingStatus, String> {
+    let slot = contributor_worker_slot();
+    let mut guard = slot
+        .lock()
+        .map_err(|_| "Contributor worker process lock is poisoned.".to_string())?;
 
-    let auth_key = worker_auth_key(&worker_name);
-    let existing_auth = connection
-        .get::<_, Option<String>>(&auth_key)
-        .map_err(|error| format!("Failed to check existing worker auth {}: {error}", auth_key))?;
-    if existing_auth.is_some() {
-        return Err("That worker name is already registered.".to_string());
+    if let Some(child) = guard.as_mut() {
+        match child.try_wait() {
+            Ok(None) => {
+                let runtime = contributor_runtime_snapshot();
+                return Ok(ContributorSharingStatus {
+                    running: true,
+                    pid: Some(child.id()),
+                    details: "Sharing is already running.".to_string(),
+                    job_running: runtime.job_running,
+                    current_job_id: runtime.current_job_id,
+                    last_job_id: runtime.last_job_id,
+                });
+            }
+            Ok(Some(_)) | Err(_) => {
+                *guard = None;
+            }
+        }
     }
 
-    let registered_at_unix = current_unix_timestamp();
-    let worker_id = Uuid::new_v4().to_string();
-    let worker_record = RedisWorkerRecord {
-        id: worker_id.clone(),
-        status: "available".to_string(),
-        resources: RedisWorkerResources {
-            cpu_cores: DEFAULT_CONTRIBUTOR_CPU_CORES,
-            memory_mb: DEFAULT_CONTRIBUTOR_MEMORY_MB,
-            gpu: DEFAULT_CONTRIBUTOR_GPU_COUNT > 0,
-        },
-        current_load: RedisWorkerCurrentLoad {
-            cpu_used: 0,
-            memory_used: 0,
-        },
-        capabilities: RedisWorkerCapabilities {
-            docker: true,
-            gpu_supported: DEFAULT_CONTRIBUTOR_GPU_COUNT > 0,
-        },
-        last_heartbeat: registered_at_unix,
-        stats: RedisWorkerStats {
-            jobs_completed: 0,
-            jobs_failed: 0,
-        },
-    };
-    let worker_payload = serde_json::to_string(&worker_record)
-        .map_err(|error| format!("Failed to serialize worker record: {error}"))?;
-    let auth_record = RedisWorkerAuthRecord {
-        worker_id: worker_id.clone(),
-        worker_name: worker_name.clone(),
-        password_hash: password_hash.clone(),
-    };
-    let auth_payload = serde_json::to_string(&auth_record)
-        .map_err(|error| format!("Failed to serialize worker auth record: {error}"))?;
-    let local_identity = LocalWorkerIdentity {
-        worker_id: worker_id.clone(),
-        worker_name: worker_name.clone(),
-        worker_hash: build_worker_hash(&worker_id, &worker_name, &password_hash)?,
-    };
-    save_local_worker_identity(&local_identity)?;
+    reset_contributor_runtime_state();
 
-    redis::pipe()
-        .atomic()
-        .sadd(WORKERS_KEY, &worker_id)
-        .ignore()
-        .set(redis_worker_key(&worker_id), worker_payload)
-        .ignore()
-        .set(auth_key, auth_payload)
-        .ignore()
-        .set(redis_worker_alive_key(&worker_id), "1")
-        .ignore()
-        .set(CONTRIBUTOR_ACTIVE_WORKER_KEY, &worker_id)
-        .ignore()
-        .query::<()>(&mut connection)
-        .map_err(|error| format!("Failed to store contributor worker in Redis: {error}"))?;
+    let mut command = resolve_worker_command()?;
+    configure_worker_command(&mut command)?;
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let child = command
+        .stdin(Stdio::null())
+        .spawn()
+        .map_err(|error| format!("Failed to start local worker process: {error}"))?;
 
-    Ok(to_contributor_worker_record(&worker_record))
+    let mut child = child;
+    if let Some(stdout) = child.stdout.take() {
+        thread::spawn(move || stream_worker_logs(stdout));
+    }
+    if let Some(stderr) = child.stderr.take() {
+        thread::spawn(move || stream_worker_logs(stderr));
+    }
+
+    let pid = child.id();
+    *guard = Some(child);
+
+    let runtime = contributor_runtime_snapshot();
+    Ok(ContributorSharingStatus {
+        running: true,
+        pid: Some(pid),
+        details: "Sharing started. Worker process is running in background.".to_string(),
+        job_running: runtime.job_running,
+        current_job_id: runtime.current_job_id,
+        last_job_id: runtime.last_job_id,
+    })
 }
 
 #[tauri::command]
-fn get_registered_contributor_worker() -> Result<Option<ContributorWorkerRecord>, String> {
-    let config = app_config()?;
-    let client = redis::Client::open(config.redis_url.as_str())
-        .map_err(|error| format!("Failed to parse the Redis URL: {error}"))?;
-    let mut connection = client
-        .get_connection()
-        .map_err(|error| format!("Failed to connect to Redis: {error}"))?;
+fn stop_contributor_sharing() -> Result<ContributorSharingStatus, String> {
+    let slot = contributor_worker_slot();
+    let mut guard = slot
+        .lock()
+        .map_err(|_| "Contributor worker process lock is poisoned.".to_string())?;
 
-    let Some(local_identity) = load_local_worker_identity()? else {
-        return Ok(None);
-    };
-    let worker_id = local_identity.worker_id;
+    if let Some(mut child) = guard.take() {
+        let pid = child.id();
+        stop_worker_process(&mut child);
+        let runtime = contributor_runtime_snapshot();
 
-    let worker_payload = connection
-        .get::<_, Option<String>>(redis_worker_key(&worker_id))
-        .map_err(|error| {
-            format!(
-                "Failed to load worker record {}: {error}",
-                redis_worker_key(&worker_id)
-            )
-        })?;
-
-    let Some(worker_payload) = worker_payload else {
-        return Ok(None);
-    };
-
-    let worker_record: RedisWorkerRecord = match serde_json::from_str(&worker_payload) {
-        Ok(record) => record,
-        Err(_) => return Ok(None),
-    };
-
-    let auth_payload = connection
-        .get::<_, Option<String>>(worker_auth_key(&local_identity.worker_name))
-        .map_err(|error| format!("Failed to load worker auth for {}: {error}", local_identity.worker_name))?;
-    let Some(auth_payload) = auth_payload else {
-        return Ok(None);
-    };
-    let auth_record: RedisWorkerAuthRecord = serde_json::from_str(&auth_payload)
-        .map_err(|error| format!("Failed to parse worker auth: {error}"))?;
-    let expected_hash =
-        build_worker_hash(&auth_record.worker_id, &auth_record.worker_name, &auth_record.password_hash)?;
-    if expected_hash != local_identity.worker_hash {
-        return Err("This is not your device.".to_string());
+        return Ok(ContributorSharingStatus {
+            running: false,
+            pid: Some(pid),
+            details: "Sharing stopped. Worker process was terminated.".to_string(),
+            job_running: false,
+            current_job_id: None,
+            last_job_id: runtime.last_job_id,
+        });
     }
 
-    Ok(Some(to_contributor_worker_record(&worker_record)))
+    let runtime = contributor_runtime_snapshot();
+
+    Ok(ContributorSharingStatus {
+        running: false,
+        pid: None,
+        details: "Sharing is already stopped.".to_string(),
+        job_running: false,
+        current_job_id: None,
+        last_job_id: runtime.last_job_id,
+    })
 }
 
 #[tauri::command]
-fn login_contributor_worker(
-    worker_name: String,
-    password: String,
-) -> Result<ContributorWorkerRecord, String> {
-    let worker_name = normalize_worker_name(&worker_name)?;
-    let password_hash = hash_string(password.trim());
-    let local_identity = load_local_worker_identity()?
-        .ok_or_else(|| "No local worker identity was found on this device.".to_string())?;
-    let config = app_config()?;
-    let client = redis::Client::open(config.redis_url.as_str())
-        .map_err(|error| format!("Failed to parse the Redis URL: {error}"))?;
-    let mut connection = client
-        .get_connection()
-        .map_err(|error| format!("Failed to connect to Redis: {error}"))?;
+fn get_contributor_sharing_status() -> Result<ContributorSharingStatus, String> {
+    let slot = contributor_worker_slot();
+    let mut guard = slot
+        .lock()
+        .map_err(|_| "Contributor worker process lock is poisoned.".to_string())?;
 
-    let auth_payload = connection
-        .get::<_, Option<String>>(worker_auth_key(&worker_name))
-        .map_err(|error| format!("Failed to load worker auth: {error}"))?
-        .ok_or_else(|| "Worker name or password is incorrect.".to_string())?;
-    let auth_record: RedisWorkerAuthRecord = serde_json::from_str(&auth_payload)
-        .map_err(|error| format!("Failed to parse worker auth: {error}"))?;
-    if auth_record.password_hash != password_hash {
-        return Err("Worker name or password is incorrect.".to_string());
+    if let Some(child) = guard.as_mut() {
+        match child.try_wait() {
+            Ok(None) => {
+                let runtime = contributor_runtime_snapshot();
+                return Ok(ContributorSharingStatus {
+                    running: true,
+                    pid: Some(child.id()),
+                    details: "Worker process is running.".to_string(),
+                    job_running: runtime.job_running,
+                    current_job_id: runtime.current_job_id,
+                    last_job_id: runtime.last_job_id,
+                });
+            }
+            Ok(Some(status)) => {
+                let code = status
+                    .code()
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "unknown".to_string());
+                *guard = None;
+                let runtime = contributor_runtime_snapshot();
+                return Ok(ContributorSharingStatus {
+                    running: false,
+                    pid: None,
+                    details: format!("Worker process exited with status {code}."),
+                    job_running: false,
+                    current_job_id: None,
+                    last_job_id: runtime.last_job_id,
+                });
+            }
+            Err(error) => {
+                *guard = None;
+                let runtime = contributor_runtime_snapshot();
+                return Ok(ContributorSharingStatus {
+                    running: false,
+                    pid: None,
+                    details: format!("Failed to inspect worker process state: {error}"),
+                    job_running: false,
+                    current_job_id: None,
+                    last_job_id: runtime.last_job_id,
+                });
+            }
+        }
     }
 
-    let expected_hash =
-        build_worker_hash(&auth_record.worker_id, &auth_record.worker_name, &auth_record.password_hash)?;
-    if local_identity.worker_name != auth_record.worker_name
-        || local_identity.worker_id != auth_record.worker_id
-        || local_identity.worker_hash != expected_hash
+    let runtime = contributor_runtime_snapshot();
+
+    Ok(ContributorSharingStatus {
+        running: false,
+        pid: None,
+        details: "Worker process is not running.".to_string(),
+        job_running: false,
+        current_job_id: None,
+        last_job_id: runtime.last_job_id,
+    })
+}
+
+fn contributor_worker_slot() -> &'static Mutex<Option<Child>> {
+    CONTRIBUTOR_WORKER_CHILD.get_or_init(|| Mutex::new(None))
+}
+
+fn contributor_runtime_slot() -> &'static Mutex<ContributorRuntimeState> {
+    CONTRIBUTOR_RUNTIME_STATE.get_or_init(|| Mutex::new(ContributorRuntimeState::default()))
+}
+
+fn reset_contributor_runtime_state() {
+    if let Ok(mut runtime) = contributor_runtime_slot().lock() {
+        *runtime = ContributorRuntimeState::default();
+    }
+}
+
+fn contributor_runtime_snapshot() -> ContributorRuntimeState {
+    contributor_runtime_slot()
+        .lock()
+        .map(|runtime| ContributorRuntimeState {
+            job_running: runtime.job_running,
+            current_job_id: runtime.current_job_id.clone(),
+            last_job_id: runtime.last_job_id.clone(),
+        })
+        .unwrap_or_default()
+}
+
+fn stream_worker_logs<R>(reader: R)
+where
+    R: Read + Send + 'static,
+{
+    let lines = BufReader::new(reader).lines();
+    for line in lines.map_while(Result::ok) {
+        track_worker_runtime_from_log_line(&line);
+    }
+}
+
+fn track_worker_runtime_from_log_line(line: &str) {
+    let job_id = extract_log_field(line, "job_id");
+
+    if line.contains("job received") || line.contains("starting job") || line.contains("starting container execution") {
+        if let Ok(mut runtime) = contributor_runtime_slot().lock() {
+            runtime.job_running = true;
+            if let Some(id) = job_id.clone() {
+                runtime.current_job_id = Some(id.clone());
+                runtime.last_job_id = Some(id);
+            }
+        }
+        return;
+    }
+
+    if line.contains("finished job") || line.contains("job failed before execution completion") {
+        if let Ok(mut runtime) = contributor_runtime_slot().lock() {
+            runtime.job_running = false;
+            if let Some(id) = job_id {
+                runtime.last_job_id = Some(id.clone());
+                if runtime.current_job_id.as_deref() == Some(id.as_str()) {
+                    runtime.current_job_id = None;
+                }
+            } else {
+                runtime.current_job_id = None;
+            }
+        }
+    }
+}
+
+fn extract_log_field(line: &str, key: &str) -> Option<String> {
+    let pattern = format!("{key}=");
+    let index = line.find(&pattern)? + pattern.len();
+    let value = &line[index..];
+    if value.is_empty() {
+        return None;
+    }
+
+    if let Some(quoted) = value.strip_prefix('"') {
+        let end = quoted.find('"')?;
+        let parsed = quoted[..end].trim();
+        return if parsed.is_empty() {
+            None
+        } else {
+            Some(parsed.to_string())
+        };
+    }
+
+    let raw = value.split_whitespace().next().unwrap_or_default().trim();
+    if raw.is_empty() {
+        None
+    } else {
+        Some(raw.to_string())
+    }
+}
+
+fn resolve_worker_command() -> Result<Command, String> {
+    if let Some(path) = optional_env("COMPUTEHIVE_WORKER_BIN") {
+        let worker_bin = PathBuf::from(path);
+        if worker_bin.exists() {
+            return Ok(Command::new(worker_bin));
+        }
+    }
+
+    let worker_dir = workspace_worker_dir()?;
+    let compiled_worker = worker_dir.join("worker");
+    if compiled_worker.exists() {
+        return Ok(Command::new(compiled_worker));
+    }
+
+    let mut command = Command::new("go");
+    command.current_dir(worker_dir).arg("run").arg("./cmd/worker");
+    Ok(command)
+}
+
+fn configure_worker_command(command: &mut Command) -> Result<(), String> {
+    #[cfg(unix)]
     {
-        return Err("This is not your device.".to_string());
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setpgid(0, 0) == 0 {
+                    Ok(())
+                } else {
+                    Err(io::Error::last_os_error())
+                }
+            });
+        }
     }
 
-    connection
-        .set::<_, _, ()>(CONTRIBUTOR_ACTIVE_WORKER_KEY, &auth_record.worker_id)
-        .map_err(|error| format!("Failed to mark the active worker: {error}"))?;
-
-    let worker_payload = connection
-        .get::<_, Option<String>>(redis_worker_key(&auth_record.worker_id))
-        .map_err(|error| format!("Failed to load worker record: {error}"))?
-        .ok_or_else(|| "The worker record could not be found.".to_string())?;
-    let worker_record: RedisWorkerRecord = serde_json::from_str(&worker_payload)
-        .map_err(|error| format!("Failed to parse worker record: {error}"))?;
-    Ok(to_contributor_worker_record(&worker_record))
+    Ok(())
 }
 
-#[tauri::command]
-fn activate_contributor_worker() -> Result<ContributorWorkerRecord, String> {
-    let local_identity = load_local_worker_identity()?
-        .ok_or_else(|| "No local worker identity was found on this device.".to_string())?;
-    let config = app_config()?;
-    let client = redis::Client::open(config.redis_url.as_str())
-        .map_err(|error| format!("Failed to parse the Redis URL: {error}"))?;
-    let mut connection = client
-        .get_connection()
-        .map_err(|error| format!("Failed to connect to Redis: {error}"))?;
+fn stop_worker_process(child: &mut Child) {
+    #[cfg(unix)]
+    {
+        let group_id = child.id() as i32;
 
-    let worker_payload = connection
-        .get::<_, Option<String>>(redis_worker_key(&local_identity.worker_id))
-        .map_err(|error| format!("Failed to load worker record: {error}"))?
-        .ok_or_else(|| "The worker record could not be found.".to_string())?;
-    let mut worker_record: RedisWorkerRecord = serde_json::from_str(&worker_payload)
-        .map_err(|error| format!("Failed to parse worker record: {error}"))?;
-    worker_record.status = "active".to_string();
-    worker_record.last_heartbeat = current_unix_timestamp();
+        unsafe {
+            let _ = libc::killpg(group_id, libc::SIGTERM);
+        }
 
-    let payload = serde_json::to_string(&worker_record)
-        .map_err(|error| format!("Failed to serialize worker record: {error}"))?;
-    redis::pipe()
-        .atomic()
-        .set(redis_worker_key(&worker_record.id), payload)
-        .ignore()
-        .set(redis_worker_alive_key(&worker_record.id), "1")
-        .ignore()
-        .query::<()>(&mut connection)
-        .map_err(|error| format!("Failed to activate the worker record: {error}"))?;
+        thread::sleep(Duration::from_millis(350));
 
-    Ok(to_contributor_worker_record(&worker_record))
+        if matches!(child.try_wait(), Ok(None)) {
+            unsafe {
+                let _ = libc::killpg(group_id, libc::SIGKILL);
+            }
+        }
+
+        let _ = child.wait();
+        return;
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+}
+
+fn workspace_worker_dir() -> Result<PathBuf, String> {
+    if let Some(path) = optional_env("COMPUTEHIVE_WORKER_DIR") {
+        let dir = PathBuf::from(path);
+        if dir.exists() {
+            return Ok(dir);
+        }
+    }
+
+    let repo_guess = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../worker");
+    if repo_guess.exists() {
+        return Ok(repo_guess);
+    }
+
+    if let Ok(current_dir) = std::env::current_dir() {
+        let sibling = current_dir.join("../worker");
+        if sibling.exists() {
+            return Ok(sibling);
+        }
+    }
+
+    Err("Could not locate worker directory. Set COMPUTEHIVE_WORKER_DIR or COMPUTEHIVE_WORKER_BIN.".to_string())
 }
 
 fn build_project_docker_image(project_path: &str) -> Result<DockerImageResult, String> {
@@ -1998,18 +2048,6 @@ fn current_unix_timestamp() -> i64 {
         .unwrap_or(0)
 }
 
-fn worker_auth_key(worker_name: &str) -> String {
-    format!("{WORKER_AUTH_PREFIX}{worker_name}")
-}
-
-fn redis_worker_key(worker_id: &str) -> String {
-    format!("worker:{worker_id}")
-}
-
-fn redis_worker_alive_key(worker_id: &str) -> String {
-    format!("worker_alive:{worker_id}")
-}
-
 fn job_key(job_id: &str) -> String {
     format!("job:{job_id}")
 }
@@ -2204,100 +2242,6 @@ fn optional_env(key: &str) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-fn to_contributor_worker_record(worker_record: &RedisWorkerRecord) -> ContributorWorkerRecord {
-    ContributorWorkerRecord {
-        id: worker_record.id.clone(),
-        status: worker_record.status.clone(),
-        resources: ContributorWorkerResources {
-            cpu_cores: worker_record.resources.cpu_cores,
-            memory_mb: worker_record.resources.memory_mb,
-            gpu: worker_record.resources.gpu,
-        },
-        current_load: ContributorWorkerCurrentLoad {
-            cpu_used: worker_record.current_load.cpu_used,
-            memory_used: worker_record.current_load.memory_used,
-        },
-        capabilities: ContributorWorkerCapabilities {
-            docker: worker_record.capabilities.docker,
-            gpu_supported: worker_record.capabilities.gpu_supported,
-        },
-        last_heartbeat: worker_record.last_heartbeat,
-        stats: ContributorWorkerStats {
-            jobs_completed: worker_record.stats.jobs_completed,
-            jobs_failed: worker_record.stats.jobs_failed,
-        },
-    }
-}
-
-fn normalize_worker_name(worker_name: &str) -> Result<String, String> {
-    let normalized = worker_name.trim().to_lowercase();
-    if normalized.is_empty() {
-        return Err("Worker name is required.".to_string());
-    }
-    Ok(normalized)
-}
-
-fn hash_string(value: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(value.as_bytes());
-    format!("{:x}", hasher.finalize())
-}
-
-fn build_worker_hash(worker_id: &str, worker_name: &str, password_hash: &str) -> Result<String, String> {
-    let fingerprint = local_device_fingerprint()?;
-    Ok(hash_string(&format!(
-        "{worker_id}:{worker_name}:{password_hash}:{fingerprint}"
-    )))
-}
-
-fn local_device_fingerprint() -> Result<String, String> {
-    let hostname = Command::new("hostname")
-        .output()
-        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
-        .unwrap_or_default();
-    let username = std::env::var("USER").unwrap_or_default();
-    let home = std::env::var("HOME").unwrap_or_default();
-    let raw = format!(
-        "{}:{}:{}:{}:{}",
-        std::env::consts::OS,
-        std::env::consts::ARCH,
-        username,
-        home,
-        hostname
-    );
-    if raw.trim_matches(':').is_empty() {
-        return Err("Unable to derive a stable device fingerprint.".to_string());
-    }
-    Ok(hash_string(&raw))
-}
-
-fn local_worker_identity_path() -> Result<PathBuf, String> {
-    let home = std::env::var("HOME")
-        .map(PathBuf::from)
-        .map_err(|_| "HOME is not set, so the local worker identity cannot be stored.".to_string())?;
-    Ok(home.join(LOCAL_WORKER_IDENTITY_FILE))
-}
-
-fn save_local_worker_identity(identity: &LocalWorkerIdentity) -> Result<(), String> {
-    let path = local_worker_identity_path()?;
-    let payload = serde_json::to_vec(identity)
-        .map_err(|error| format!("Failed to serialize the local worker identity: {error}"))?;
-    fs::write(&path, payload)
-        .map_err(|error| format!("Failed to store the local worker identity at {}: {error}", path.display()))
-}
-
-fn load_local_worker_identity() -> Result<Option<LocalWorkerIdentity>, String> {
-    let path = local_worker_identity_path()?;
-    if !path.exists() {
-        return Ok(None);
-    }
-    let payload = fs::read(&path)
-        .map_err(|error| format!("Failed to read the local worker identity at {}: {error}", path.display()))?;
-    let identity = serde_json::from_slice(&payload)
-        .map_err(|error| format!("Failed to parse the local worker identity: {error}"))?;
-    Ok(Some(identity))
-}
-
 fn sanitize_name(name: &str) -> String {
     let sanitized = name
         .chars()
@@ -2388,10 +2332,9 @@ pub fn run() {
             request_project_run,
             list_incoming_run_requests,
             get_run_request_result,
-            register_contributor_worker,
-            login_contributor_worker,
-            activate_contributor_worker,
-            get_registered_contributor_worker
+            start_contributor_sharing,
+            stop_contributor_sharing,
+            get_contributor_sharing_status
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
