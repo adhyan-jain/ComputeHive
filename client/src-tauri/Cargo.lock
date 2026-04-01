@@ -581,6 +581,7 @@ dependencies = [
  "dotenvy",
  "flate2",
  "hmac",
+ "libc",
  "prost",
  "protoc-bin-vendored",
  "redis",

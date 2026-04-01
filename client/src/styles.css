@@ -712,7 +712,8 @@ h3 {
 }
 
 .contributor-grid {
-  grid-template-columns: minmax(0, 1.15fr) minmax(320px, 0.85fr);
+  grid-template-columns: minmax(0, 1fr);
+  justify-items: center;
 }
 
 .queue-list {
@@ -788,6 +789,8 @@ h3 {
 .contributor-aside {
   display: grid;
   gap: 1rem;
+  width: 100%;
+  max-width: 760px;
 }
 
 .contributor-form {
@@ -946,6 +949,18 @@ h3 {
   word-break: break-word;
 }
 
+.contributor-profile {
+  width: 100%;
+  background:
+    linear-gradient(160deg, rgba(255, 252, 246, 0.94), rgba(250, 244, 235, 0.92)),
+    radial-gradient(circle at top right, rgba(15, 118, 110, 0.08), transparent 36%);
+}
+
+.contributor-dashboard-head {
+  border-bottom: 1px solid rgba(29, 26, 23, 0.08);
+  padding-bottom: 1rem;
+}
+
 .future-block,
 .future-notes {
   position: relative;
@@ -958,6 +973,10 @@ h3 {
 }
 
 .note-row {
+  display: grid;
+  grid-template-columns: 160px minmax(0, 1fr);
+  gap: 0.8rem;
+  align-items: baseline;
   padding-top: 1rem;
   border-top: 1px solid rgba(29, 26, 23, 0.08);
 }
@@ -1063,6 +1082,11 @@ h3 {
   .metric-grid,
   .queue-meta {
     grid-template-columns: 1fr;
+  }
+
+  .note-row {
+    grid-template-columns: 1fr;
+    gap: 0.35rem;
   }
 
   .terminal-toolbar,
