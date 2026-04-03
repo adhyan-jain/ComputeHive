@@ -107,5 +107,6 @@ See component-specific setup in:
 
 ## Notes
 
+
 - `docker-compose.yml` is currently not wired.
 - Proto generation is checked in under `coordinator/pkg/pb` and `worker/pkg/pb`.
