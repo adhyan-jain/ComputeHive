@@ -1,90 +1,61 @@
-# Worker Node
+# ComputeHive Worker
 
-This folder contains the first bootstrap of the ComputeHive worker node. The worker is a small Go service that:
+The worker is a Go service that executes coordinator-assigned jobs in Docker.
 
-- sends heartbeats to Redis
-- reports machine resources
-- pulls jobs from a Redis queue
-- downloads image archives from object storage
-- verifies the uploaded archive hash
-- loads and executes jobs inside Docker containers
-- stores job status and results back in Redis
+Core behavior:
+
+- registers with coordinator `WorkerService/RegisterWorker`
+- sends periodic heartbeats
+- polls jobs from coordinator `WorkerService/RequestJob`
+- downloads and verifies artifact archives when present
+- runs container workload with CPU/memory/GPU constraints
+- uploads collected output artifacts when configured
+- submits final status via `WorkerService/SubmitResult`
 
 ## Folder Structure
 
 ```text
 worker/
-├── cmd/worker               # CLI entrypoint
-├── internal/artifact        # Artifact download + SHA256 verification
-├── internal/config          # Env and flag parsing
-├── internal/domain          # Job, result, and heartbeat models
-├── internal/executor        # Docker load + run pipeline
-├── internal/resources       # CPU, memory, GPU, Docker reporting
-├── internal/store           # Minimal Redis client + worker persistence
-├── internal/worker          # Main worker loop
-├── examples                 # Sample job payloads
-├── Dockerfile               # Optional container image for the worker
-└── .env.example             # Local configuration template
+├── cmd/worker/              # Entrypoint
+├── internal/artifact/       # Artifact fetch + hash verification
+├── internal/config/         # Env/flag parsing
+├── internal/domain/         # Job/result/heartbeat models
+├── internal/executor/       # Docker execution pipeline
+├── internal/output/         # Output collection + object storage upload
+├── internal/resources/      # Host capability and load reporting
+├── internal/store/          # Coordinator gRPC client adapter
+├── internal/worker/         # Worker loop and orchestration
+├── pkg/pb/                  # Generated protobuf types
+└── Dockerfile
 ```
 
-## What This Version Supports
+## Runtime Requirements
 
-- Redis-backed job queue using `BRPOP`
-- periodic heartbeats with TTL
-- worker status changes: `idle`, `busy`
-- image archive download from signed URLs or bucket URLs
-- SHA256 verification before execution
-- `docker load` followed by isolated `docker run`
-- Docker job isolation with CPU and memory limits
-- optional GPU job flag support through `--gpus all`
-- result publishing for later coordinator and dashboard work
+- Go 1.25+
+- Docker daemon + `docker` CLI
+- network reachability to coordinator and Redis/object storage endpoints
 
-## Job Format
+## Configuration
 
-Push JSON payloads like this into the pending queue:
+The worker reads values from environment variables, optional `.env`, and CLI flags.
 
-```json
-{
-  "task_id": "sample-job-001",
-  "s3_url": "https://example-bucket.r2.dev/tasks/sample-job-001.tar.gz",
-  "image_hash": "replace-with-sha256-of-the-tar-gz",
-  "image_ref": "computehive/sample-job-001:latest",
-  "command": [
-    "python",
-    "-c",
-    "total = sum(i * i for i in range(1000000)); print(total)"
-  ],
-  "env": {
-    "PYTHONUNBUFFERED": "1"
-  },
-  "cpu_cores": 1,
-  "memory_mb": 256,
-  "timeout_seconds": 120,
-  "gpu": false
-}
-```
+Most-used settings:
 
-The worker expects the uploaded archive to come from:
+- `COORDINATOR_ADDR` (default: `127.0.0.1:50051`)
+- `WORKER_ID` (default: hostname-based)
+- `POLL_VIA_SERVER` (default: `true`)
+- `REDIS_ADDR` / `REDIS_URL`
+- `REDIS_USERNAME`, `REDIS_PASSWORD`, `REDIS_DB`, `REDIS_USE_TLS`
+- `HEARTBEAT_INTERVAL`, `HEARTBEAT_TTL`
+- `DEFAULT_JOB_TIMEOUT`
+- `DOCKER_BINARY`
+- `ALLOW_GPU_JOBS`
+- `S3_BUCKET`, `S3_PUBLIC_BUCKET_URL`
+- `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY`, `S3_SESSION_TOKEN`
+- `S3_SIGN_REQUESTS`, `S3_SIGNING_REGION`, `S3_SIGNING_SERVICE`
+- `OUTPUT_COLLECTION_DIR`, `OUTPUT_MAX_FILES`, `OUTPUT_MAX_BYTES`
 
-```bash
-docker build -t computehive/sample-job-001:latest .
-docker save computehive/sample-job-001:latest | gzip > sample-job-001.tar.gz
-```
-
-The `image_ref` in the job payload must match a tag present inside the uploaded archive.
-
-## Redis Keys
-
-- queue: `computehive:jobs:pending`
-- results list: `computehive:jobs:results`
-- job status key: `computehive:jobs:<job-id>:status`
-- job result key: `computehive:jobs:<job-id>:result`
-- worker heartbeat key: `computehive:workers:<worker-id>:heartbeat`
-
-Two pub/sub channels are also emitted for future coordinator and dashboard integration:
-
-- `computehive:events:workers`
-- `computehive:events:jobs`
+Run `go run ./cmd/worker -h` to view all supported flags.
 
 ## Run Locally
 
@@ -93,35 +64,36 @@ cd worker
 go run ./cmd/worker
 ```
 
-You can override config through flags or environment variables:
+Example with explicit coordinator and Redis values:
 
 ```bash
 go run ./cmd/worker \
-  -worker-id worker-local-01 \
+  -coordinator-addr 127.0.0.1:50051 \
   -redis-addr 127.0.0.1:6379 \
-  -queue-key computehive:jobs:pending
+  -worker-id worker-local-01
 ```
 
-## Queue A Sample Job
+## Build and Test
 
 ```bash
-redis-cli LPUSH computehive:jobs:pending "$(cat examples/sample-job.json)"
-```
-
-## Build The Worker
-
-```bash
+cd worker
+go test ./...
 go build ./cmd/worker
 ```
 
 ## Containerized Worker
 
-The `Dockerfile` builds the worker itself. If you run the worker container, mount the host Docker socket so the worker can start job containers:
+The worker executes Docker jobs, so mount the host Docker socket when running in a container:
 
 ```bash
 docker build -t computehive-worker ./worker
 docker run --rm \
-  -e REDIS_ADDR=host.docker.internal:6379 \
+  -e COORDINATOR_ADDR=host.docker.internal:50051 \
   -v /var/run/docker.sock:/var/run/docker.sock \
   computehive-worker
 ```
+
+## Notes
+
+- Current store implementation is coordinator gRPC-driven for polling and result submission.
+- `POLL_VIA_SERVER` is currently expected to remain enabled.

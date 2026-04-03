@@ -1,197 +1,111 @@
 # ComputeHive
 
-ComputeHive is a decentralized compute-sharing prototype.
+ComputeHive is a distributed compute prototype with three core pieces:
 
-Current implementation focus:
+- a Go coordinator service that exposes gRPC APIs
+- a Go worker runtime that executes container jobs
+- a Tauri desktop client that builds/upload artifacts and submits jobs
 
-- Coordinator backend in Go
-- gRPC contracts in shared proto files
-- Redis-backed state, queueing, and worker liveness tracking
+## Monorepo Layout
 
-This README documents what is implemented so far.
+```text
+ComputeHive/
+├── client/                  # Tauri desktop app (Vite + TypeScript + Rust)
+├── coordinator/             # gRPC coordinator service (Go)
+├── worker/                  # Worker runtime (Go)
+├── shared/proto/            # Protobuf source contracts
+└── docker-compose.yml       # Reserved for local stack wiring (currently empty)
+```
 
-## Implemented So Far
+## Component Overview
 
-### Phase 1: Coordinator server skeleton
+### Coordinator (`coordinator/`)
 
-- gRPC server bootstrapped on configurable port (default 50051)
-- Redis connection initialized at startup using cloud configuration only (no localhost fallback)
-- Worker and Client gRPC services registered
-- Project structured with cmd, internal, and generated pb packages
+- Runs WorkerService and ClientService gRPC endpoints
+- Persists worker/job state in Redis
+- Schedules pending jobs to eligible workers
+- Requeues running jobs when a worker heartbeat expires
 
-### Phase 2: Core pipeline
+Default listener: `:50051`
 
-- Worker registration
-- Worker heartbeats with TTL-based liveness key
-- Job submission and Redis queueing
-- Worker job pull flow
-- Result submission and job completion updates
-- Job status and result queries from client side
+### Worker (`worker/`)
 
-End-to-end flow implemented:
-Client submit -> queued in Redis -> worker pulls -> worker submits result -> client reads status and result
+- Registers itself with the coordinator
+- Sends periodic heartbeats with resource snapshots
+- Pulls jobs from coordinator `RequestJob`
+- Downloads and verifies artifacts when provided
+- Executes jobs using Docker and submits results via gRPC
 
-### Phase 3: Resilience and fairness
+### Desktop Client (`client/`)
 
-- Fair scheduler (round-robin with basic resource eligibility checks)
-- Background worker monitor that detects dropped workers by heartbeat key expiry
-- Automatic requeue of running jobs assigned to dropped workers
-- Job to worker assignment mapping in Redis
-- Partial result checkpoint support (minimal)
-- Structured logs for important events (registration, submission, assignment, completion, disconnect)
-
-## Repository Layout
-
-    ComputeHive/
-    ├── coordinator/
-    │   ├── cmd/server/main.go
-    │   ├── internal/
-    │   │   ├── config/config.go
-    │   │   ├── grpc/
-    │   │   │   ├── server.go
-    │   │   │   └── handlers.go
-    │   │   ├── scheduler/scheduler.go
-    │   │   └── store/redis.go
-    │   ├── pkg/pb/
-    │   │   ├── client.pb.go
-    │   │   ├── client_grpc.pb.go
-    │   │   ├── worker.pb.go
-    │   │   └── worker_grpc.pb.go
-    │   ├── go.mod
-    │   └── go.sum
-    ├── shared/
-    │   └── proto/
-    │       ├── client.proto
-    │       └── worker.proto
-    ├── worker/
-    ├── client/
-    ├── infra/
-    ├── examples/
-    └── scripts/
+- Builds Docker image from a selected project directory
+- Compresses and uploads the image artifact to object storage
+- Submits run requests to coordinator
+- Polls job result and shows execution output
+- Can start/stop a local worker process in contributor mode
 
 ## gRPC Contracts
 
-Source of truth:
+Source files:
 
-- shared/proto/worker.proto
-- shared/proto/client.proto
+- `shared/proto/worker.proto`
+- `shared/proto/client.proto`
 
-Services currently available:
+Services:
 
-- compute.v1.WorkerService
-  - RegisterWorker
-  - Heartbeat
-  - RequestJob
-  - SubmitResult
-- compute.v1.ClientService
-  - SubmitJob
-  - GetJobStatus
-  - GetJobResult
-
-## Redis Data Model In Use
-
-Keys used by coordinator:
-
-- workers (SET)
-- worker:{id} (STRING JSON)
-- worker_alive:{id} (STRING with TTL)
-
-- job_queue (LIST)
-- job:{id} (STRING JSON)
-- job_status:{id} (STRING: queued | running | completed | failed)
-- job_worker:{id} (STRING: assigned worker id)
-- result:{id} (STRING JSON)
+- `compute.v1.WorkerService`
+  - `RegisterWorker`
+  - `Heartbeat`
+  - `RequestJob`
+  - `SubmitResult`
+- `compute.v1.ClientService`
+  - `SubmitJob`
+  - `GetJobStatus`
+  - `GetJobResult`
 
 ## Prerequisites
 
-- Go 1.24+
-- Docker
-- Cloud Redis endpoint with TLS and password
-- protoc, protoc-gen-go, protoc-gen-go-grpc
-- grpcurl for manual API testing
+- Go 1.24+ (coordinator) and Go 1.25+ (worker)
+- Docker daemon and Docker CLI
+- Redis instance (cloud or local for worker/client experiments)
+- Node.js + pnpm (desktop client frontend)
+- Rust toolchain + Tauri system dependencies (desktop client)
 
-## Run Coordinator (Cloud Redis)
+## Quick Start
 
-1. Set environment variables
+1. Start coordinator
 
-   export REDIS_ADDR="<cloud-redis-host>:<port>"
-   export REDIS_PASSWORD="<cloud-redis-password>"
-   export REDIS_TLS=true
-   export REDIS_DB=0
+```bash
+cd coordinator
+export REDIS_ADDR="<redis-host>:<port>"
+export REDIS_PASSWORD="<redis-password>"
+export REDIS_DB=0
+export REDIS_TLS=true
+go run cmd/server/main.go
+```
 
-2. Start Coordinator
+2. Start worker
 
-   cd coordinator
-   go mod tidy
-   go run cmd/server/main.go
+```bash
+cd worker
+export COORDINATOR_ADDR="127.0.0.1:50051"
+go run ./cmd/worker
+```
 
-Expected log:
+3. Start desktop client
 
-- coordinator gRPC server listening on :50051
+```bash
+cd client
+pnpm install
+pnpm tauri dev
+```
 
-## Manual API Smoke Test
+See component-specific setup in:
 
-From repository root:
+- `client/README.md`
+- `worker/README.md`
 
-1. Register a worker
+## Notes
 
-   grpcurl -plaintext -import-path shared/proto -proto worker.proto \
-    -d '{"availableResources":{"cpuCores":4,"gpuCount":0,"memoryMb":8192},"workerVersion":"v0.1.0"}' \
-    localhost:50051 compute.v1.WorkerService/RegisterWorker
-
-2. Submit a job
-
-   grpcurl -plaintext -import-path shared/proto -proto client.proto -proto worker.proto \
-    -d '{"containerImage":"python:3.11","command":["python","-c","print(\"hello\")"],"requiredResources":{"cpuCores":1,"gpuCount":0,"memoryMb":512},"environment":{"ENV":"dev"},"maxRuntimeSeconds":30}' \
-    localhost:50051 compute.v1.ClientService/SubmitJob
-
-3. Worker requests a job
-
-   grpcurl -plaintext -import-path shared/proto -proto worker.proto \
-    -d '{"workerId":{"value":"<worker-id>"}}' \
-    localhost:50051 compute.v1.WorkerService/RequestJob
-
-4. Worker submits result
-
-   grpcurl -plaintext -import-path shared/proto -proto worker.proto \
-    -d '{"workerId":{"value":"<worker-id>"},"result":{"jobId":{"value":"<job-id>"},"status":"STATUS_SUCCEEDED","exitCode":0,"stdoutExcerpt":"done","finishedAtUnix":1735689600}}' \
-    localhost:50051 compute.v1.WorkerService/SubmitResult
-
-5. Client checks status and result
-
-   grpcurl -plaintext -import-path shared/proto -proto client.proto -proto worker.proto \
-    -d '{"jobId":{"value":"<job-id>"}}' \
-    localhost:50051 compute.v1.ClientService/GetJobStatus
-
-   grpcurl -plaintext -import-path shared/proto -proto client.proto -proto worker.proto \
-    -d '{"jobId":{"value":"<job-id>"}}' \
-    localhost:50051 compute.v1.ClientService/GetJobResult
-
-## Testing Worker Drop-off Requeue
-
-1. Register and heartbeat worker, submit and assign a job.
-2. Stop sending heartbeat for that worker for more than 10 seconds.
-3. Scheduler monitor detects expired worker_alive key.
-4. Running jobs assigned to that worker are requeued to job_queue.
-5. Another alive worker can pull the requeued job.
-
-Check coordinator logs for lines similar to:
-
-- worker disconnected: worker_id=... requeued_jobs=...
-
-## Current Status
-
-Coordinator MVP is robust enough for hackathon demos:
-
-- Fair worker selection
-- Heartbeat-based failure detection
-- Requeue safety for dropped workers
-- End-to-end client and worker APIs over gRPC
-
-## Next Recommended Steps
-
-- Add idempotency for result submission
-- Add retry controls and dead-letter handling
-- Add authentication and authorization
-- Add metrics and dashboard service endpoints
-- Implement worker execution node and integrate client UX
+- `docker-compose.yml` is currently not wired.
+- Proto generation is checked in under `coordinator/pkg/pb` and `worker/pkg/pb`.
